@@ -29,6 +29,50 @@ else:
     _real_threading = threading
 
 
+def _resolve_ws_client_class():
+    """Pick the WebSocket client implementation for the Zerodha feed.
+
+    ZERODHA_WS_CLIENT selects between:
+      - 'kiteticker' (default): the official Kite Connect Python SDK
+        (pykiteconnect KiteTicker, Twisted-based)
+      - 'native': the built-in raw websocket-client implementation
+
+    The KiteTicker path is only valid in a non-eventlet process (the dev
+    server, or the out-of-process WS proxy under gunicorn+eventlet) because
+    Twisted's reactor does not run under eventlet monkey-patching -- fall back
+    to the native client there rather than starting a broken feed.
+    """
+    choice = os.getenv("ZERODHA_WS_CLIENT", "kiteticker").strip().lower()
+    if choice in ("native", "raw", "legacy"):
+        return ZerodhaWebSocket
+    if choice not in ("kiteticker", "sdk", "pykiteconnect", "official"):
+        logger.warning(f"Unknown ZERODHA_WS_CLIENT value {choice!r} -- using default 'kiteticker'")
+
+    if "eventlet" in sys.modules:
+        try:
+            from eventlet.patcher import is_monkey_patched
+
+            if is_monkey_patched("socket"):
+                logger.warning(
+                    "Eventlet monkey-patching active -- KiteTicker (Twisted) is not "
+                    "supported here; falling back to native Zerodha WebSocket client"
+                )
+                return ZerodhaWebSocket
+        except Exception:
+            pass
+
+    try:
+        from .zerodha_kite_ticker import ZerodhaKiteTickerClient
+
+        return ZerodhaKiteTickerClient
+    except Exception as e:
+        logger.warning(
+            f"Official kiteconnect SDK unavailable ({e}) -- falling back to native "
+            f"Zerodha WebSocket client"
+        )
+        return ZerodhaWebSocket
+
+
 class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
     """
     Fixed Zerodha-specific implementation of the WebSocket adapter.
@@ -110,7 +154,9 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Initialize WebSocket client. Pass user_id so the client can
             # re-read a fresh access token from the database on reconnect
             # (tokens roll over daily at ~3 AM IST).
-            self.ws_client = ZerodhaWebSocket(
+            ws_client_cls = _resolve_ws_client_class()
+            self.logger.info(f"Using Zerodha WebSocket client: {ws_client_cls.__name__}")
+            self.ws_client = ws_client_cls(
                 api_key=self.api_key,
                 access_token=self.access_token,
                 on_ticks=self._handle_ticks,
