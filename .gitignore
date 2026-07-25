@@ -94,3 +94,14 @@ yarn-error.log*
 
 # Windows NUL file
 nul
+
+# Ruflo (claude-flow) runtime artifacts - config in .claude/ and .claude-flow/config.yaml is tracked
+.agents/
+.swarm/
+.claude-flow/data/
+.claude-flow/logs/
+.claude-flow/sessions/
+.claude-flow/metrics/
+.claude-flow/learning/
+.claude-flow/security/
+.claude-flow/memory-package.json
