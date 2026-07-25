@@ -105,3 +105,9 @@ nul
 .claude-flow/learning/
 .claude-flow/security/
 .claude-flow/memory-package.json
+.claude-flow/daemon-state.json
+.claude-flow/daemon.pid
+.claude-flow/harness-active-policy.json
+.claude-flow/swarm/
+.claude/.proven-config-version
+.claude/proven-config.json
