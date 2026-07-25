@@ -209,6 +209,11 @@ class RSIMeanReversionBot:
         # main loop adopts the position if it appears, so a slow fill cannot
         # cause a doubled entry on the next cycle.
         self.pending_entry: tuple[str, float] | None = None
+        # Order id of an exit that was placed but never resolved. Rechecked
+        # before any new exit order so sustained orderstatus/positionbook
+        # failures cannot stack closing orders (a second fill would flip the
+        # account to the opposite side).
+        self.pending_exit_order_id: str | None = None
         self.exit_in_progress = False
         self.ltp = 0.0
         self.lock = threading.Lock()
@@ -350,6 +355,14 @@ class RSIMeanReversionBot:
         self.state = side  # publish last
 
     def enter(self, side: str):
+        if self.pending_entry:
+            # An earlier accepted-but-unresolved entry order may still fill.
+            # Placing another order now could double (or oppose) the position,
+            # and the exit path only closes QUANTITY. Wait until the pending
+            # window adopts or expires; the crossing is not consumed so a
+            # still-valid signal retries afterwards.
+            log(f"Skipping {side} entry - pending entry order still unresolved")
+            return False
         action = "BUY" if side == LONG else "SELL"
         order_id = self.place_market(action)
         if not order_id:
@@ -423,6 +436,22 @@ class RSIMeanReversionBot:
             self.exit_in_progress = True
         try:
             side = self.state
+
+            # An earlier exit order may have gone unresolved. Re-check IT
+            # before placing another closing order -- if it actually filled,
+            # a second exit would flip the account to the opposite side.
+            if self.pending_exit_order_id:
+                outcome, _ = self.confirm_fill(self.pending_exit_order_id)
+                if outcome == "filled" or self._position_exists(side) is False:
+                    log(f"Earlier exit order resolved - exited {side} ({reason})")
+                    self.pending_exit_order_id = None
+                    self._go_flat()
+                    return
+                if outcome != "rejected":
+                    log("Earlier exit order still unresolved - not stacking another")
+                    return
+                self.pending_exit_order_id = None  # rejected: safe to re-place
+
             action = "SELL" if side == LONG else "BUY"
             order_id = self.place_market(action)
             if not order_id:
@@ -435,16 +464,22 @@ class RSIMeanReversionBot:
                 # Only go FLAT when the book POSITIVELY confirms the position
                 # is gone. Both 'still open' (True) and 'check failed' (None)
                 # must keep the state and retry -- treating an API error as
-                # 'exited' would abandon a live position.
+                # 'exited' would abandon a live position. Remember the order
+                # id so the retry resolves THIS order instead of stacking.
                 if self._position_exists(side) is not False:
+                    self.pending_exit_order_id = order_id
                     log("Exit unresolved - assuming still open, will retry")
                     return
             log(f"Exited {side} ({reason})")
-            self.state = FLAT
-            self.armed = False
-            self.entry_price = self.stoploss_price = self.target_price = 0.0
+            self.pending_exit_order_id = None
+            self._go_flat()
         finally:
             self.exit_in_progress = False
+
+    def _go_flat(self):
+        self.state = FLAT
+        self.armed = False
+        self.entry_price = self.stoploss_price = self.target_price = 0.0
 
     # ------------------------------ live LTP ------------------------------
 
