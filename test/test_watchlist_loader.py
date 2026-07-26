@@ -59,6 +59,15 @@ class TestWatchlistFilePath:
     def test_strips_exchange(self, tmp_path):
         assert watchlist_file_path(" MCX ", tmp_path).name == "MCX.txt"
 
+    def test_sanitizes_path_traversal(self, tmp_path):
+        # A hostile/malformed exchange must not escape the watchlist dir.
+        p = watchlist_file_path("../../etc/passwd", tmp_path)
+        assert p.parent == tmp_path
+        assert "/" not in p.name and ".." not in p.name
+
+    def test_empty_exchange_is_unknown(self, tmp_path):
+        assert watchlist_file_path("", tmp_path).name == "UNKNOWN.txt"
+
 
 class TestLoadWatchlistPrecedence:
     def test_env_wins_over_file_and_default(self, tmp_path):
@@ -89,6 +98,13 @@ class TestLoadWatchlistPrecedence:
     def test_non_nse_empty_when_unset(self, tmp_path):
         assert load_watchlist("MCX", DEFAULT_NSE, None, tmp_path) == []
         assert load_watchlist("NFO", DEFAULT_NSE, None, tmp_path) == []
+
+    def test_bse_equity_uses_default_when_unset(self, tmp_path):
+        # BSE is an equity cash exchange: the large-cap default list is valid
+        # there, so an unconfigured BSE strategy must still scan (backward
+        # compatible with the pre-loader four_ema behavior), unlike MCX/NFO.
+        assert load_watchlist("BSE", DEFAULT_NSE, None, tmp_path) == DEFAULT_NSE
+        assert load_watchlist(" bse ", DEFAULT_NSE, None, tmp_path) == DEFAULT_NSE
 
     def test_non_nse_still_honors_env(self, tmp_path):
         assert load_watchlist("MCX", DEFAULT_NSE, "CRUDEOIL25JULFUT", tmp_path) == [

@@ -129,7 +129,11 @@ def compute_metrics(candles: list[dict], lookback: int = 20) -> dict | None:
             )
     n = len(window)
     atr = sum(true_ranges) / n
-    adr = sum((highs[i] - lows[i]) / closes[i] for i in range(n) if closes[i] > 0) / n
+    # Average daily range as a fraction of close, over bars with a valid
+    # (positive) close only -- divide by the count of contributing bars so a
+    # stray zero/negative close cannot silently deflate the average.
+    adr_terms = [(highs[i] - lows[i]) / closes[i] for i in range(n) if closes[i] > 0]
+    adr = sum(adr_terms) / len(adr_terms) if adr_terms else 0.0
     avg_turnover = sum(closes[i] * vols[i] for i in range(n)) / n
     avg_volume = sum(vols) / n
 
@@ -369,13 +373,24 @@ def main(argv: list[str] | None = None) -> int:
         f"top-k {args.top_k}"
     )
 
+    # Close the SDK client (and its underlying HTTP/WS connections) on every
+    # path -- this is a one-shot CLI, but leaking the descriptors would violate
+    # the repo's close-on-all-paths convention.
     metrics_by_symbol: dict[str, dict] = {}
-    for i, symbol in enumerate(universe):
-        metrics_by_symbol[symbol] = fetch_metrics(
-            client, symbol, exchange, args.interval, args.lookback
-        )
-        if args.sleep > 0 and i < len(universe) - 1:
-            time.sleep(args.sleep)
+    try:
+        for i, symbol in enumerate(universe):
+            metrics_by_symbol[symbol] = fetch_metrics(
+                client, symbol, exchange, args.interval, args.lookback
+            )
+            if args.sleep > 0 and i < len(universe) - 1:
+                time.sleep(args.sleep)
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
     ranked = rank_symbols(
         metrics_by_symbol,

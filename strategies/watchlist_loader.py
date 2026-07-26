@@ -17,10 +17,12 @@ the list of symbols a scanning strategy should trade, with this PRECEDENCE:
           an empty universe), it does NOT fall through to the default.
 
     3. else (no env, no file)
-       -> for NSE return default_nse (normalized); for any non-NSE exchange
-          (MCX, NFO, ...) return [] -- the same "no guessing expiry symbols"
-          rule the intraday strategies already follow, since MCX/derivative
-          symbols carry expiries and there is no safe hardcoded default.
+       -> for an EQUITY CASH exchange (NSE, BSE) return default_nse
+          (normalized -- those large-cap symbols are valid on both); for any
+          other exchange (MCX, NFO, BFO, CDS, NCDEX, ...) return [] -- the same
+          "no guessing expiry symbols" rule the intraday strategies already
+          follow, since derivative/commodity symbols carry expiries and there
+          is no safe hardcoded default.
 
 The screened file is produced by strategies/screener.py (the pre-market
 liquidity + volatility screener).
@@ -33,6 +35,11 @@ from pathlib import Path
 # Directory (relative to this module, i.e. strategies/) that holds the
 # per-exchange screened watchlist files when no explicit dir is given.
 _DEFAULT_DIRNAME = "watchlists"
+
+# Equity cash exchanges whose large-cap default list is valid. Non-NSE/BSE
+# exchanges (MCX, NFO, BFO, CDS, NCDEX, ...) carry expiry/commodity symbols
+# with no safe hardcoded default, so they scan nothing when unconfigured.
+_EQUITY_CASH_EXCHANGES = frozenset({"NSE", "BSE"})
 
 
 def parse_symbol_list(text: str | None) -> list[str]:
@@ -80,7 +87,13 @@ def watchlist_file_path(exchange: str, watchlist_dir: str | Path | None = None) 
         base = Path(watchlist_dir)
     else:
         base = Path(__file__).resolve().parent / _DEFAULT_DIRNAME
-    return base / f"{(exchange or '').strip().upper()}.txt"
+    # Sanitize the exchange to a bare alphanumeric token so a hostile or
+    # malformed value (e.g. "../../etc/passwd") cannot escape the directory --
+    # real OpenAlgo exchange codes are alphanumeric (NSE, BSE, NFO, MCX, ...).
+    safe = "".join(ch for ch in (exchange or "").strip().upper() if ch.isalnum())
+    if not safe:
+        safe = "UNKNOWN"
+    return base / f"{safe}.txt"
 
 
 def load_watchlist(
@@ -93,8 +106,9 @@ def load_watchlist(
 
     Args:
         exchange: OpenAlgo exchange code (e.g. "NSE", "MCX").
-        default_nse: The fallback symbol list used ONLY for NSE when neither an
-            env value nor a screened file is present.
+        default_nse: The fallback symbol list used for the equity cash
+            exchanges (NSE, BSE) when neither an env value nor a screened file
+            is present.
         env_value: The raw WATCHLIST env value, or None when the env var is
             unset. An explicit empty string yields [] (env wins).
         watchlist_dir: Optional override for the screened-file directory.
@@ -115,7 +129,8 @@ def load_watchlist(
         # Unreadable file -> fall through to the default rule, never raise.
         pass
 
-    # 3. Default: NSE gets the fallback list; other exchanges scan nothing.
-    if (exchange or "").strip().upper() == "NSE":
+    # 3. Default: equity cash exchanges (NSE, BSE) get the fallback list;
+    #    derivative/commodity exchanges scan nothing (no safe expiry default).
+    if (exchange or "").strip().upper() in _EQUITY_CASH_EXCHANGES:
         return parse_symbol_list(",".join(default_nse))
     return []
