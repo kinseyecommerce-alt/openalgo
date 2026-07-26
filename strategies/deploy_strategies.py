@@ -1,16 +1,26 @@
 """Deployment automation for OpenAlgo's Python Strategy Host.
 
-Registers the two production strategies (RSI mean-reversion and Four-EMA
-retracement) with the /python host by copying each source file into
+Registers strategies with the /python host by copying each source file into
 strategies/scripts/<strategy_id>.py and merging a host-conformant config
 entry into strategies/strategy_configs.json. The host's APScheduler then
 auto-starts/stops them at the given IST times on trading days.
 
+Two kinds of registrations exist:
+    - The two original production strategies (RSI mean-reversion and Four-EMA
+      retracement), deployed by DEFAULT.
+    - The 20 variants of the multi-variant intraday engine
+      (scripts/variant_intraday_strategy.py). Each variant deploys the SAME
+      source file under a different stem (the variant key); the engine
+      resolves its active variant from the deployed filename. These are
+      NEVER deployed by default -- turning on 20 auto-trading strategies must
+      be an explicit choice: pass --strategies all-variants for the 20, a
+      comma-separated subset of variant keys, or 'all' for everything.
+
 Usage:
     uv run python strategies/deploy_strategies.py --user <user_id> \
         [--exchange NSE] [--start 09:20] [--stop 15:20] \
-        [--days mon,tue,wed,thu,fri] [--dry-run] [--force] [--list] \
-        [--config-dir <dir>]
+        [--days mon,tue,wed,thu,fri] [--strategies <stems>|all-variants|all] \
+        [--dry-run] [--force] [--list] [--config-dir <dir>]
 
 Design notes:
     - Idempotent: an existing registration whose file_name starts with the
@@ -36,11 +46,50 @@ from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# The two production strategies this script owns (stem = filename without .py).
+# The two original production strategies this script owns
+# (stem = filename without .py). These are the DEFAULT deployment set.
 STRATEGY_STEMS = (
     "rsi_meanreversion_strategy",
     "four_ema_retracement_strategy",
 )
+
+# The multi-variant intraday engine: ONE source file deployed under many
+# stems. Keys must stay in sync with the VARIANTS registry in
+# strategies/scripts/variant_intraday_strategy.py -- the engine resolves its
+# active variant from the deployed filename stem.
+VARIANT_SOURCE_STEM = "variant_intraday_strategy"
+VARIANT_KEYS = (
+    "ema_ribbon_trend",
+    "vwap_breakout",
+    "vwap_reversion",
+    "orb_breakout",
+    "supertrend_follow",
+    "bollinger_squeeze",
+    "bollinger_reversion",
+    "macd_momentum",
+    "donchian_breakout",
+    "stochastic_reversal",
+    "atr_channel_ride",
+    "prev_day_level_fade",
+    "momentum_roc",
+    "heikin_ashi_trend",
+    "volume_spike_breakout",
+    "inside_bar_breakout",
+    "engulfing_at_ema",
+    "pivot_bounce",
+    "gap_go",
+    "triple_ema_cross",
+)
+
+# All registrations as (source_stem, deploy_stem): the file
+# scripts/<source_stem>.py is copied to scripts/<deploy_stem>_<ts>.py.
+STRATEGIES = tuple((stem, stem) for stem in STRATEGY_STEMS) + tuple(
+    (VARIANT_SOURCE_STEM, key) for key in VARIANT_KEYS
+)
+SOURCE_BY_DEPLOY_STEM = {deploy: source for source, deploy in STRATEGIES}
+
+# Deploying the 20 variants must be an explicit opt-in (--strategies).
+DEFAULT_DEPLOY_STEMS = STRATEGY_STEMS
 
 VALID_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
@@ -49,7 +98,12 @@ HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 # Default locations (repo layout). --config-dir overrides the base dir that
 # holds strategy_configs.json and the scripts/ copy target, for testability.
 DEFAULT_CONFIG_DIR = Path(__file__).resolve().parent
-DEFAULT_SOURCE_DIR = DEFAULT_CONFIG_DIR / "scripts"
+# Source the canonical strategy files from strategies/examples/ -- that is the
+# git-tracked copy present on every fresh clone. strategies/scripts/ is
+# gitignored (it holds runtime/user uploads and is empty after a plain clone),
+# so sourcing from there would make deploy fail on a production server. We copy
+# FROM examples/ INTO scripts/<id>.py (the runtime location the host reads).
+DEFAULT_SOURCE_DIR = DEFAULT_CONFIG_DIR / "examples"
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +155,50 @@ def validate_days(value):
     if not days:
         raise ValueError("Day list must contain at least one day")
     return days
+
+
+def resolve_strategy_selection(value):
+    """Parse the --strategies flag into an ordered list of deploy stems.
+
+    Args:
+        value: Raw flag value, or None when the flag was not given. Accepts a
+            comma-separated list of deploy stems plus the special tokens
+            "all" (every registration) and "all-variants" (the 20
+            variant-engine deployments).
+
+    Returns:
+        Ordered, de-duplicated list of deploy stems. None maps to the
+        default set (the two original production strategies ONLY -- the 20
+        variants are always an explicit opt-in).
+
+    Raises:
+        ValueError: If the selection is empty or names an unknown stem.
+    """
+    if value is None:
+        return list(DEFAULT_DEPLOY_STEMS)
+    if not isinstance(value, str):
+        raise ValueError("--strategies must be a comma-separated string of deploy stems")
+    tokens = [t.strip() for t in value.split(",") if t.strip()]
+    if not tokens:
+        raise ValueError("--strategies must name at least one deploy stem")
+    selection = []
+    for token in tokens:
+        key = token.lower()
+        if key == "all":
+            expansion = [deploy for _, deploy in STRATEGIES]
+        elif key == "all-variants":
+            expansion = list(VARIANT_KEYS)
+        elif key in SOURCE_BY_DEPLOY_STEM:
+            expansion = [key]
+        else:
+            raise ValueError(
+                f"Unknown strategy {token!r}: expected 'all', 'all-variants', or one of "
+                + ", ".join(deploy for _, deploy in STRATEGIES)
+            )
+        for stem in expansion:
+            if stem not in selection:
+                selection.append(stem)
+    return selection
 
 
 def build_config(
@@ -270,8 +368,10 @@ def list_registrations(config_file):
     return 0
 
 
-def deploy(user_id, exchange, start, stop, days, config_dir, source_dir, dry_run, force):
-    """Deploy the production strategies into the host's registry.
+def deploy(
+    user_id, exchange, start, stop, days, config_dir, source_dir, dry_run, force, stems=None
+):
+    """Deploy the selected strategies into the host's registry.
 
     Args:
         user_id: Owner user id for the registrations.
@@ -283,10 +383,14 @@ def deploy(user_id, exchange, start, stop, days, config_dir, source_dir, dry_run
         source_dir: Dir holding the strategy source files.
         dry_run: If True, print the plan without writing anything.
         force: If True, redeploy over an existing registration.
+        stems: Deploy stems to register (from resolve_strategy_selection).
+            None deploys the default set (the two original strategies).
 
     Returns:
         Process exit code (0 on success, 1 on error).
     """
+    if stems is None:
+        stems = list(DEFAULT_DEPLOY_STEMS)
     config_file = config_dir / "strategy_configs.json"
     scripts_dir = config_dir / "scripts"
     configs = load_configs(config_file)
@@ -294,8 +398,12 @@ def deploy(user_id, exchange, start, stop, days, config_dir, source_dir, dry_run
     timestamp = now.strftime("%Y%m%d%H%M%S")
     changed = False
 
-    for stem in STRATEGY_STEMS:
-        source = source_dir / f"{stem}.py"
+    for stem in stems:
+        source_stem = SOURCE_BY_DEPLOY_STEM.get(stem)
+        if source_stem is None:
+            print(f"error: unknown deploy stem: {stem}", file=sys.stderr)
+            return 1
+        source = source_dir / f"{source_stem}.py"
         if not source.is_file():
             print(f"error: source file not found: {source}", file=sys.stderr)
             return 1
@@ -376,6 +484,16 @@ def main(argv=None):
         default="mon,tue,wed,thu,fri",
         help="Comma-separated schedule days (subset of mon..sun)",
     )
+    parser.add_argument(
+        "--strategies",
+        default=None,
+        help=(
+            "Comma-separated deploy stems to deploy. Default: the two original "
+            "production strategies only. Special values: 'all-variants' deploys "
+            "the 20 variant-engine strategies, 'all' deploys everything. "
+            "Deploying the 20 variants is always an explicit opt-in."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print plan without writing")
     parser.add_argument("--force", action="store_true", help="Redeploy over existing entries")
     parser.add_argument("--list", action="store_true", help="List registrations and exit")
@@ -398,6 +516,7 @@ def main(argv=None):
         start = validate_hhmm(args.start)
         stop = validate_hhmm(args.stop)
         days = validate_days(args.days)
+        stems = resolve_strategy_selection(args.strategies)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -411,6 +530,7 @@ def main(argv=None):
         source_dir=DEFAULT_SOURCE_DIR,
         dry_run=args.dry_run,
         force=args.force,
+        stems=stems,
     )
 
 
