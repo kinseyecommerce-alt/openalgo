@@ -343,6 +343,11 @@ class FourEmaRetracementBot:
         self.position_qty = QUANTITY  # actual open quantity (reconcile may differ)
         self.ltp = 0.0
         self.lock = threading.Lock()
+        # Serializes the trailing-stop read-compute-write in _risk_check (the
+        # WS tick thread and the poll loop both run it). Kept separate from
+        # self.lock: exit_position acquires self.lock and threading.Lock is
+        # not reentrant, so a shared lock would deadlock on a stop hit.
+        self._trail_lock = threading.Lock()
         self._ws_started = False
         self._ws_symbol: str | None = None  # symbol currently subscribed on the feed
 
@@ -516,6 +521,9 @@ class FourEmaRetracementBot:
         self.symbol = symbol
         self.position_qty = qty
         self.entry_price = entry_price
+        # Seed the trailing anchor BEFORE armed becomes True: a concurrent
+        # _risk_check must never observe an armed position with extreme=0.
+        self.extreme_price = entry_price
         if entry_price > 0:
             # Recompute stop from the ACTUAL fill so slippage cannot widen risk
             # beyond the plan; keep the setup stop when it is tighter.
@@ -543,7 +551,6 @@ class FourEmaRetracementBot:
             self.initial_risk = 0.0
             self.armed = False
             log("WARNING: no entry price available - stop management disarmed")
-        self.extreme_price = entry_price
         self.breakeven_done = False
         self.state = side  # publish last
 
@@ -712,12 +719,6 @@ class FourEmaRetracementBot:
             self.exit_position("stoploss")
             return
 
-        # Track the best price reached since entry (the trailing anchor).
-        if self.state == LONG:
-            self.extreme_price = max(self.extreme_price, price)
-        else:
-            self.extreme_price = min(self.extreme_price, price) if self.extreme_price else price
-
         if EXIT_MODE == "TARGET":
             action = manage_position(
                 self.state,
@@ -739,25 +740,39 @@ class FourEmaRetracementBot:
                 )
             return
 
-        # TRAIL mode: ratchet the stop behind the extreme; no profit cap.
-        new_stop = update_trailing_stop(
-            self.state,
-            self.entry_price,
-            self.initial_risk,
-            self.extreme_price,
-            self.stop_price,
-            BREAKEVEN_R,
-            TRAIL_R,
-        )
-        if new_stop != self.stop_price:
-            # Log meaningful ratchets only, so a fast tape does not spam the
-            # strategy log with sub-tick stop updates.
-            if abs(new_stop - self.stop_price) >= max(0.05, 0.1 * self.initial_risk):
-                log(
-                    f"{self.symbol}: trailing stop {self.stop_price:.2f} -> "
-                    f"{new_stop:.2f} (extreme {self.extreme_price:.2f})"
+        # TRAIL mode: track the best price since entry, ratchet the stop.
+        # Serialized under _trail_lock: without it, the WS tick thread and the
+        # poll loop can interleave the stop read-compute-write and a stale
+        # read would overwrite the other thread's tighter ratchet. The stop
+        # check and exit_position above deliberately stay OUTSIDE this lock so
+        # order placement is never performed while holding it. (The extreme is
+        # only consumed by the trail ratchet, so tracking it here in TRAIL
+        # mode only is equivalent.)
+        with self._trail_lock:
+            if self.state == LONG:
+                self.extreme_price = max(self.extreme_price, price)
+            else:
+                self.extreme_price = (
+                    min(self.extreme_price, price) if self.extreme_price else price
                 )
-            self.stop_price = new_stop
+            new_stop = update_trailing_stop(
+                self.state,
+                self.entry_price,
+                self.initial_risk,
+                self.extreme_price,
+                self.stop_price,
+                BREAKEVEN_R,
+                TRAIL_R,
+            )
+            if new_stop != self.stop_price:
+                # Log meaningful ratchets only, so a fast tape does not spam
+                # the strategy log with sub-tick stop updates.
+                if abs(new_stop - self.stop_price) >= max(0.05, 0.1 * self.initial_risk):
+                    log(
+                        f"{self.symbol}: trailing stop {self.stop_price:.2f} -> "
+                        f"{new_stop:.2f} (extreme {self.extreme_price:.2f})"
+                    )
+                self.stop_price = new_stop
 
     def start_ltp_feed(self, symbol: str):
         """Subscribe the feed to `symbol`, reusing ONE connection and dropping

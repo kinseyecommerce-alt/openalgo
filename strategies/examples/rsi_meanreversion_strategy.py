@@ -260,6 +260,11 @@ class RSIMeanReversionBot:
         self.extreme_price = 0.0  # best price since entry (trailing anchor)
         self.ltp = 0.0
         self.lock = threading.Lock()
+        # Serializes the trailing-stop read-compute-write in _risk_check (the
+        # WS tick thread and the poll loop both run it). Kept separate from
+        # self.lock: exit_position acquires self.lock and threading.Lock is
+        # not reentrant, so a shared lock would deadlock on a stop hit.
+        self._trail_lock = threading.Lock()
         self.ws_connected = False
 
     # ------------------------------ helpers ------------------------------
@@ -389,6 +394,9 @@ class RSIMeanReversionBot:
         live tick; the cutoff exit protects it meanwhile.
         """
         self.entry_price = entry_price
+        # Seed the trailing anchor BEFORE armed becomes True: a concurrent
+        # _risk_check must never observe an armed position with extreme=0.
+        self.extreme_price = entry_price
         if entry_price > 0:
             self.stoploss_price, self.target_price = self._risk_levels_for(side, entry_price)
             if EXIT_MODE != "TARGET":
@@ -399,7 +407,6 @@ class RSIMeanReversionBot:
         else:
             self.stoploss_price = self.target_price = 0.0
             self.armed = False
-        self.extreme_price = entry_price
         self.state = side  # publish last
 
     def enter(self, side: str):
@@ -560,27 +567,35 @@ class RSIMeanReversionBot:
         if EXIT_MODE == "TARGET":
             return
         # TRAIL mode: track the best price since entry, ratchet the stop.
-        if self.state == LONG:
-            self.extreme_price = max(self.extreme_price, price)
-        else:
-            self.extreme_price = min(self.extreme_price, price) if self.extreme_price else price
-        new_stop = update_trailing_stop(
-            self.state,
-            self.entry_price,
-            STOPLOSS,
-            self.extreme_price,
-            self.stoploss_price,
-            BREAKEVEN_R,
-            TRAIL_R,
-        )
-        if new_stop != self.stoploss_price:
-            # Log meaningful ratchets only so a fast tape does not spam.
-            if abs(new_stop - self.stoploss_price) >= max(0.05, 0.1 * STOPLOSS):
-                log(
-                    f"Trailing stop {self.stoploss_price:.2f} -> {new_stop:.2f} "
-                    f"(extreme {self.extreme_price:.2f})"
+        # Serialized under _trail_lock: without it, the WS tick thread and the
+        # poll loop can interleave the stop read-compute-write and a stale
+        # read would overwrite the other thread's tighter ratchet. The stop
+        # check and exit_position above deliberately stay OUTSIDE this lock so
+        # order placement is never performed while holding it.
+        with self._trail_lock:
+            if self.state == LONG:
+                self.extreme_price = max(self.extreme_price, price)
+            else:
+                self.extreme_price = (
+                    min(self.extreme_price, price) if self.extreme_price else price
                 )
-            self.stoploss_price = new_stop
+            new_stop = update_trailing_stop(
+                self.state,
+                self.entry_price,
+                STOPLOSS,
+                self.extreme_price,
+                self.stoploss_price,
+                BREAKEVEN_R,
+                TRAIL_R,
+            )
+            if new_stop != self.stoploss_price:
+                # Log meaningful ratchets only so a fast tape does not spam.
+                if abs(new_stop - self.stoploss_price) >= max(0.05, 0.1 * STOPLOSS):
+                    log(
+                        f"Trailing stop {self.stoploss_price:.2f} -> {new_stop:.2f} "
+                        f"(extreme {self.extreme_price:.2f})"
+                    )
+                self.stoploss_price = new_stop
 
     def start_ltp_feed(self):
         """Best-effort WebSocket LTP for real-time SL/target; REST fallback if it fails."""
@@ -656,8 +671,12 @@ class RSIMeanReversionBot:
 
                     # REST SL/target/trailing check every cycle. Runs even when
                     # the WS feed claims to be up -- a silently-dead feed must
-                    # not disable risk enforcement; exit_position dedupes.
-                    self._risk_check(closes[-1])
+                    # not disable risk enforcement; exit_position dedupes. Uses
+                    # a LIVE price (WS LTP, REST quote fallback), never a candle
+                    # close: the last close can be a full candle old (and from
+                    # BEFORE entry right after a fill), and a stale extreme
+                    # would ratchet the trailing stop against a fresh position.
+                    self._risk_check(self.ltp or self.fetch_quote_ltp())
 
                     action = decide(
                         self.state,
