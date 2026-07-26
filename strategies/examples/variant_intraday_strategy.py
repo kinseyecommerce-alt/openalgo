@@ -62,6 +62,11 @@ from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# Make the shared watchlist loader importable whether this file runs from
+# strategies/scripts, strategies/examples, or a deployed copy in strategies/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from watchlist_loader import load_watchlist  # noqa: E402
+
 # ===============================================================================
 # CONFIGURATION (env vars, read once at startup)
 # ===============================================================================
@@ -76,20 +81,24 @@ EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NSE"))
 # stocks; scanning is capped to respect API rate limits. MCX symbols carry
 # expiries (e.g. CRUDEOILM20MAY24FUT) so there is NO safe hardcoded MCX
 # watchlist: with EXCHANGE=MCX and WATCHLIST unset the engine scans nothing.
-DEFAULT_NSE_WATCHLIST = (
-    "RELIANCE,HDFCBANK,ICICIBANK,INFY,TCS,SBIN,AXISBANK,LT,ITC,TATAMOTORS"
-)
+DEFAULT_NSE_WATCHLIST = [
+    "RELIANCE",
+    "HDFCBANK",
+    "ICICIBANK",
+    "INFY",
+    "TCS",
+    "SBIN",
+    "AXISBANK",
+    "LT",
+    "ITC",
+    "TATAMOTORS",
+]
 _WATCHLIST_ENV = os.getenv("WATCHLIST")
-if _WATCHLIST_ENV is None and EXCHANGE == "MCX":
-    WATCHLIST = []
-else:
-    WATCHLIST = [
-        s.strip().upper()
-        for s in (_WATCHLIST_ENV if _WATCHLIST_ENV is not None else DEFAULT_NSE_WATCHLIST).split(
-            ","
-        )
-        if s.strip()
-    ]
+# Shared loader precedence: WATCHLIST env wins (empty string -> no symbols);
+# else a screened strategies/watchlists/<EXCHANGE>.txt; else the NSE default
+# for NSE and NOTHING for MCX/other expiry-bearing exchanges. This preserves
+# the previous behavior exactly (env set -> parse; MCX + unset -> []).
+WATCHLIST = load_watchlist(EXCHANGE, DEFAULT_NSE_WATCHLIST, _WATCHLIST_ENV)
 MAX_SCAN_SYMBOLS = 20
 QUANTITY = int(os.getenv("QUANTITY", "1"))
 PRODUCT = os.getenv("PRODUCT", "MIS")

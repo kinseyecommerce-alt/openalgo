@@ -47,6 +47,11 @@ from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# Make the shared watchlist loader importable whether this file runs from
+# strategies/scripts, strategies/examples, or a deployed copy in strategies/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from watchlist_loader import load_watchlist  # noqa: E402
+
 # ===============================================================================
 # CONFIGURATION (env vars, read once at startup)
 # ===============================================================================
@@ -56,15 +61,25 @@ API_HOST = os.getenv("HOST_SERVER", "http://127.0.0.1:5000")
 WS_URL = os.getenv("WEBSOCKET_URL", "ws://127.0.0.1:8765")
 
 EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NSE"))
-# Comma-separated OpenAlgo symbols. The strategy documents target liquid F&O
-# stocks; scanning is capped to respect API rate limits.
-WATCHLIST = [
-    s.strip().upper()
-    for s in os.getenv(
-        "WATCHLIST", "RELIANCE,HDFCBANK,ICICIBANK,INFY,TCS,SBIN,AXISBANK,LT,ITC,TATAMOTORS"
-    ).split(",")
-    if s.strip()
+# Watchlist resolution via the shared loader (see strategies/watchlist_loader):
+#   1. WATCHLIST env wins (comma list; an explicit empty string -> no symbols)
+#   2. else a screened strategies/watchlists/<EXCHANGE>.txt (from the screener)
+#   3. else the default NSE liquid-F&O list for NSE, nothing for other exchanges
+#      (MCX and other derivative symbols carry expiries -- no safe default).
+# Scanning is capped by MAX_SCAN_SYMBOLS to respect API rate limits.
+DEFAULT_NSE_WATCHLIST = [
+    "RELIANCE",
+    "HDFCBANK",
+    "ICICIBANK",
+    "INFY",
+    "TCS",
+    "SBIN",
+    "AXISBANK",
+    "LT",
+    "ITC",
+    "TATAMOTORS",
 ]
+WATCHLIST = load_watchlist(EXCHANGE, DEFAULT_NSE_WATCHLIST, os.getenv("WATCHLIST"))
 MAX_SCAN_SYMBOLS = 20
 QUANTITY = int(os.getenv("QUANTITY", "1"))
 PRODUCT = os.getenv("PRODUCT", "MIS")

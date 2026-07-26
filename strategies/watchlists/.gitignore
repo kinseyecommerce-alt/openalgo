@@ -1,0 +1,3 @@
+# Screener output (regenerated pre-market); keep the dir, ignore contents
+*.txt
+!.gitignore
