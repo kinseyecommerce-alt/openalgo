@@ -35,13 +35,12 @@ Usage:
     # scheduled: call run_auto_login(openalgo_username) from a daily job a few
     # minutes after the ~3 AM IST token rollover (e.g. 06:00 IST on trade days).
 
-The pure helpers (generate_totp / extract_request_token / build_checksum /
+The pure helpers (generate_totp / extract_request_token / read_credentials /
 redact) are network-free and unit-tested in
 test/test_zerodha_auto_login.py.
 """
 
 import argparse
-import hashlib
 import os
 import re
 import sys
@@ -85,9 +84,15 @@ def generate_totp(secret: str) -> str:
         raise ValueError(f"Invalid TOTP secret: {e}") from e
 
 
-def build_checksum(api_key: str, request_token: str, api_secret: str) -> str:
-    """SHA-256 checksum Kite requires for the session-token exchange."""
-    return hashlib.sha256(f"{api_key}{request_token}{api_secret}".encode()).hexdigest()
+def _is_kite_host(url: str) -> bool:
+    """True when the URL's host is a Kite/Zerodha domain (redirect-follow guard)."""
+    if not url:
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host.endswith("zerodha.com") or host.endswith("kite.trade")
 
 
 def extract_request_token(url: str) -> str | None:
@@ -260,6 +265,14 @@ def fetch_request_token(creds: dict, timeout: float = 30.0) -> str:
             token = extract_request_token(location)
             if token:
                 return token
+            # Only chase further hops that stay on Kite/Zerodha. The token is
+            # always read off the Location header above BEFORE any fetch, so a
+            # legitimate flow never needs to follow an off-host redirect; refusing
+            # to means a manipulated Location cannot make this client issue a
+            # request (carrying no cookies cross-domain, but still) to an
+            # arbitrary host.
+            if not _is_kite_host(location):
+                break
             try:
                 resp = client.get(location)
             except Exception:

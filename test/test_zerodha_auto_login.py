@@ -4,7 +4,6 @@ Covers TOTP generation, request_token extraction, checksum, credential
 validation, and secret redaction -- all network-free (no calls to Kite).
 """
 
-import hashlib
 import os
 import sys
 import time
@@ -19,7 +18,7 @@ os.environ.setdefault("APP_KEY", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 from broker.zerodha.api.auto_login import (
-    build_checksum,
+    _is_kite_host,
     extract_request_token,
     generate_totp,
     read_credentials,
@@ -85,13 +84,22 @@ class TestExtractRequestToken:
         assert extract_request_token("https://x/cb?request_token=") is None
 
 
-class TestBuildChecksum:
-    def test_matches_sha256(self):
-        expected = hashlib.sha256(b"KEYTOKENSECRET").hexdigest()
-        assert build_checksum("KEY", "TOKEN", "SECRET") == expected
+class TestIsKiteHost:
+    def test_accepts_kite_zerodha(self):
+        assert _is_kite_host("https://kite.zerodha.com/connect/login?x=1")
+        assert _is_kite_host("https://api.kite.trade/session/token")
 
-    def test_order_matters(self):
-        assert build_checksum("a", "b", "c") != build_checksum("c", "b", "a")
+    def test_accepts_subdomains(self):
+        assert _is_kite_host("https://kite.zerodha.com/oms")
+
+    def test_rejects_off_host(self):
+        assert not _is_kite_host("https://evil.example/steal?request_token=x")
+        assert not _is_kite_host("https://zerodha.com.evil.example/x")
+
+    def test_rejects_empty_and_relative(self):
+        assert not _is_kite_host("")
+        assert not _is_kite_host("/connect/finish")  # relative -> no host
+        assert not _is_kite_host(None)
 
 
 class TestReadCredentials:
