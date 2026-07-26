@@ -906,6 +906,19 @@ class FourEmaRetracementBot:
                     else:
                         price = self.ltp or self.fetch_quote_ltp(self.symbol)
                         self._risk_check(price)
+                        if price <= 0 and self.armed:
+                            # Degraded mode (WS dead AND quotes failing,
+                            # history still up): still enforce the stop
+                            # against the last closed candle so the position
+                            # is not left with only the cutoff exit. STOP-HIT
+                            # CHECK ONLY -- the trailing ratchet stays
+                            # live-price-only and must never act on a stale
+                            # candle close.
+                            candles = self.fetch_closed_candles(self.symbol)
+                            if candles is not None and len(candles) > 0:
+                                last_close = float(candles.iloc[-1]["close"])
+                                if check_stop(self.state, last_close, self.stop_price):
+                                    self.exit_position("stoploss")
                 elif not self.past_entry_cutoff() and not self.pending_entry:
                     for symbol in self.watchlist:
                         if self.state != FLAT:

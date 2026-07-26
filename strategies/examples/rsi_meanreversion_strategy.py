@@ -676,7 +676,20 @@ class RSIMeanReversionBot:
                     # close: the last close can be a full candle old (and from
                     # BEFORE entry right after a fill), and a stale extreme
                     # would ratchet the trailing stop against a fresh position.
-                    self._risk_check(self.ltp or self.fetch_quote_ltp())
+                    live_price = self.ltp or self.fetch_quote_ltp()
+                    self._risk_check(live_price)
+                    if live_price <= 0 and self.state != FLAT and self.armed:
+                        # Degraded mode (WS dead AND quotes failing, history
+                        # still up): still enforce the stop against the last
+                        # closed candle so the position is not left with only
+                        # the cutoff exit. STOP-HIT CHECK ONLY -- the trailing
+                        # ratchet stays live-price-only and must never act on
+                        # a stale candle close.
+                        reason = check_price_exit(
+                            self.state, closes[-1], self.stoploss_price, self.target_price
+                        )
+                        if reason:
+                            self.exit_position(reason)
 
                     action = decide(
                         self.state,
