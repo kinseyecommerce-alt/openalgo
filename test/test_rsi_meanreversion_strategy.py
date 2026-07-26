@@ -26,6 +26,7 @@ from rsi_meanreversion_strategy import (
     crossed_above,
     crossed_below,
     decide,
+    update_trailing_stop,
 )
 
 
@@ -168,3 +169,54 @@ class TestCheckPriceExit:
     def test_exact_stoploss_touch_triggers(self):
         assert check_price_exit(LONG, 99.5, 99.5, 102.0) == "STOPLOSS"
         assert check_price_exit(SHORT, 100.5, 100.5, 98.0) == "STOPLOSS"
+
+    def test_infinite_target_never_fires(self):
+        # TRAIL mode disables the fixed target by setting it to +/- inf.
+        assert check_price_exit(LONG, 1e12, 99.5, math.inf) is None
+        assert check_price_exit(SHORT, 1e-9, 100.5, -math.inf) is None
+
+
+class TestUpdateTrailingStop:
+    # LONG at 100, risk (STOPLOSS) 1.0, initial stop 99, breakeven_r 1.5,
+    # trail_r 1.0 -- same convention as the four-EMA strategy.
+
+    def test_untouched_below_breakeven_move(self):
+        assert update_trailing_stop(LONG, 100.0, 1.0, 101.4, 99.0) == 99.0
+
+    def test_activates_at_breakeven_move(self):
+        assert update_trailing_stop(LONG, 100.0, 1.0, 101.5, 99.0) == 100.5
+
+    def test_floors_at_cost(self):
+        assert update_trailing_stop(LONG, 100.0, 1.0, 101.5, 99.0, 1.5, 2.0) == 100.0
+
+    def test_ratchets_up_with_extreme(self):
+        stop = update_trailing_stop(LONG, 100.0, 1.0, 103.0, 99.0)
+        assert stop == 102.0
+        assert update_trailing_stop(LONG, 100.0, 1.0, 105.0, stop) == 104.0
+
+    def test_never_loosens(self):
+        assert update_trailing_stop(LONG, 100.0, 1.0, 103.0, 104.0) == 104.0
+
+    def test_winner_runs_past_fixed_target(self):
+        # At a 6x-risk extreme the trail locks in 5x risk -- far beyond the
+        # old fixed 2-rupee TARGET -- and only the giveback ends the trade.
+        stop = update_trailing_stop(LONG, 100.0, 1.0, 106.0, 99.0)
+        assert stop == 105.0
+        assert check_price_exit(LONG, 105.5, stop, math.inf) is None
+        assert check_price_exit(LONG, 105.0, stop, math.inf) == "STOPLOSS"
+
+    def test_short_mirror(self):
+        assert update_trailing_stop(SHORT, 100.0, 1.0, 98.6, 101.0) == 101.0
+        assert update_trailing_stop(SHORT, 100.0, 1.0, 98.5, 101.0) == 99.5
+        stop = update_trailing_stop(SHORT, 100.0, 1.0, 96.0, 101.0)
+        assert stop == 97.0
+        assert update_trailing_stop(SHORT, 100.0, 1.0, 97.5, stop) == 97.0
+
+    def test_short_floors_at_cost(self):
+        assert update_trailing_stop(SHORT, 100.0, 1.0, 98.5, 101.0, 1.5, 2.0) == 100.0
+
+    def test_zero_risk_is_noop(self):
+        assert update_trailing_stop(LONG, 100.0, 0.0, 150.0, 99.0) == 99.0
+
+    def test_custom_trail_distance(self):
+        assert update_trailing_stop(LONG, 100.0, 1.0, 103.0, 99.0, 1.5, 0.5) == 102.5

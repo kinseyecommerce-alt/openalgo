@@ -55,6 +55,17 @@ RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "70"))
 
 STOPLOSS = float(os.getenv("STOPLOSS", "1.0"))
 TARGET = float(os.getenv("TARGET", "2.0"))
+
+# Exit style (project-wide convention: every strategy ships both modes):
+#   TRAIL  (default) - once price moves BREAKEVEN_R x STOPLOSS in favor, the
+#            stop RATCHETS behind the best price reached at TRAIL_R x STOPLOSS
+#            distance, floored at cost, never loosening. The fixed TARGET is
+#            disabled so a winner runs for the whole move. RSI-signal exits
+#            still apply.
+#   TARGET - fixed rupee TARGET exit (the original behavior).
+EXIT_MODE = os.getenv("EXIT_MODE", "TRAIL").upper()
+BREAKEVEN_R = float(os.getenv("BREAKEVEN_R", "1.5"))
+TRAIL_R = float(os.getenv("TRAIL_R", "1.0"))
 TRADE_DIRECTION = os.getenv("TRADE_DIRECTION", "LONG").upper()
 LOOKBACK_DAYS = max(1, min(30, int(os.getenv("LOOKBACK_DAYS", "5"))))
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "15"))
@@ -185,6 +196,37 @@ def check_price_exit(
     return None
 
 
+def update_trailing_stop(
+    side: str,
+    entry: float,
+    initial_risk: float,
+    extreme: float,
+    current_stop: float,
+    breakeven_r: float = 1.5,
+    trail_r: float = 1.0,
+) -> float:
+    """Ratcheting trailing stop -- returns the new stop, never a looser one.
+
+    `extreme` is the best price reached since entry (highest for LONG,
+    lowest for SHORT). Until the move reaches breakeven_r x risk the stop is
+    untouched (the initial stop protects the trade). From there the stop
+    trails the extreme by trail_r x risk, floored at cost, and only ever
+    tightens -- a winner keeps running until the trend actually gives back
+    the trail distance, capturing the whole move.
+    """
+    if initial_risk <= 0:
+        return current_stop
+    move = (extreme - entry) if side == LONG else (entry - extreme)
+    if move < breakeven_r * initial_risk:
+        return current_stop
+    trail_distance = trail_r * initial_risk
+    if side == LONG:
+        candidate = max(entry, round(extreme - trail_distance, 2))
+        return max(current_stop, candidate)
+    candidate = min(entry, round(extreme + trail_distance, 2))
+    return min(current_stop, candidate)
+
+
 # ===============================================================================
 # I/O SHELL (SDK client, orders, polling loop)
 # ===============================================================================
@@ -215,6 +257,7 @@ class RSIMeanReversionBot:
         # account to the opposite side).
         self.pending_exit_order_id: str | None = None
         self.exit_in_progress = False
+        self.extreme_price = 0.0  # best price since entry (trailing anchor)
         self.ltp = 0.0
         self.lock = threading.Lock()
         self.ws_connected = False
@@ -348,10 +391,15 @@ class RSIMeanReversionBot:
         self.entry_price = entry_price
         if entry_price > 0:
             self.stoploss_price, self.target_price = self._risk_levels_for(side, entry_price)
+            if EXIT_MODE != "TARGET":
+                # TRAIL mode: no fixed profit cap -- the ratcheting stop (and
+                # the RSI-signal exit) decide when the winner is done.
+                self.target_price = math.inf if side == LONG else -math.inf
             self.armed = True
         else:
             self.stoploss_price = self.target_price = 0.0
             self.armed = False
+        self.extreme_price = entry_price
         self.state = side  # publish last
 
     def enter(self, side: str):
@@ -480,6 +528,7 @@ class RSIMeanReversionBot:
         self.state = FLAT
         self.armed = False
         self.entry_price = self.stoploss_price = self.target_price = 0.0
+        self.extreme_price = 0.0
 
     # ------------------------------ live LTP ------------------------------
 
@@ -496,14 +545,42 @@ class RSIMeanReversionBot:
                 # Only evaluate SL/target when explicitly armed. Never infer
                 # armed-ness from stoploss_price>0: a SHORT with entry 0 gets
                 # SL = 0 + STOPLOSS > 0 and would instantly stop out.
-                if self.state != FLAT and self.armed:
-                    reason = check_price_exit(
-                        self.state, ltp, self.stoploss_price, self.target_price
-                    )
-                    if reason:
-                        self.exit_position(reason)
+                self._risk_check(ltp)
         except Exception as e:
             log(f"LTP handler error: {e}")
+
+    def _risk_check(self, price: float):
+        """Stop / target / trailing management (WS tick and poll fallback)."""
+        if self.state == FLAT or not self.armed or price <= 0:
+            return
+        reason = check_price_exit(self.state, price, self.stoploss_price, self.target_price)
+        if reason:
+            self.exit_position(reason)
+            return
+        if EXIT_MODE == "TARGET":
+            return
+        # TRAIL mode: track the best price since entry, ratchet the stop.
+        if self.state == LONG:
+            self.extreme_price = max(self.extreme_price, price)
+        else:
+            self.extreme_price = min(self.extreme_price, price) if self.extreme_price else price
+        new_stop = update_trailing_stop(
+            self.state,
+            self.entry_price,
+            STOPLOSS,
+            self.extreme_price,
+            self.stoploss_price,
+            BREAKEVEN_R,
+            TRAIL_R,
+        )
+        if new_stop != self.stoploss_price:
+            # Log meaningful ratchets only so a fast tape does not spam.
+            if abs(new_stop - self.stoploss_price) >= max(0.05, 0.1 * STOPLOSS):
+                log(
+                    f"Trailing stop {self.stoploss_price:.2f} -> {new_stop:.2f} "
+                    f"(extreme {self.extreme_price:.2f})"
+                )
+            self.stoploss_price = new_stop
 
     def start_ltp_feed(self):
         """Best-effort WebSocket LTP for real-time SL/target; REST fallback if it fails."""
@@ -535,10 +612,19 @@ class RSIMeanReversionBot:
         if direction != TRADE_DIRECTION:
             log(f"WARNING: invalid TRADE_DIRECTION {TRADE_DIRECTION!r}, using LONG")
 
+        if EXIT_MODE == "TARGET":
+            exit_desc = f"fixed target {TARGET:.2f}"
+        else:
+            if EXIT_MODE != "TRAIL":
+                log(f"WARNING: invalid EXIT_MODE {EXIT_MODE!r}, using TRAIL")
+            exit_desc = (
+                f"trailing stop {TRAIL_R}x{STOPLOSS:.2f} behind the extreme from "
+                f"{BREAKEVEN_R}x risk (no profit cap - winners run)"
+            )
         log(
             f"RSI mean-reversion starting: {SYMBOL} {EXCHANGE} {CANDLE_TIMEFRAME} "
             f"RSI({RSI_PERIOD}) {RSI_OVERSOLD}/{RSI_OVERBOUGHT} qty={QUANTITY} "
-            f"direction={direction} cutoff={SQUARE_OFF_TIME} IST"
+            f"direction={direction} exit: {exit_desc} cutoff={SQUARE_OFF_TIME} IST"
         )
         self.reconcile_position()
         self.start_ltp_feed()
@@ -568,15 +654,10 @@ class RSIMeanReversionBot:
                     # Adopt a late-filling entry order if one is outstanding.
                     self.check_pending_entry()
 
-                    # REST SL/target check every cycle. Runs even when the WS
-                    # feed claims to be up -- a silently-dead feed must not
-                    # disable risk enforcement; exit_position dedupes.
-                    if self.state != FLAT and self.armed:
-                        reason = check_price_exit(
-                            self.state, closes[-1], self.stoploss_price, self.target_price
-                        )
-                        if reason:
-                            self.exit_position(reason)
+                    # REST SL/target/trailing check every cycle. Runs even when
+                    # the WS feed claims to be up -- a silently-dead feed must
+                    # not disable risk enforcement; exit_position dedupes.
+                    self._risk_check(closes[-1])
 
                     action = decide(
                         self.state,
