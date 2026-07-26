@@ -381,7 +381,8 @@ class FourEmaRetracementBot:
             except Exception as e:
                 log(f"{symbol}: previous-day level fetch failed: {e}")
         loaded = len([s for s in self.watchlist if s in self.prev_day_levels])
-        if loaded and missing:
+        newly_loaded = loaded - (len(self.watchlist) - len(missing))
+        if newly_loaded > 0:
             log(f"Previous-day levels loaded for {loaded}/{len(self.watchlist)} symbols")
 
     def fetch_quote_ltp(self, symbol: str) -> float:
@@ -648,8 +649,11 @@ class FourEmaRetracementBot:
             tick_symbol = data.get("symbol") or payload.get("symbol")
             # Symbol-scope the tick: after switching positions, late ticks
             # from a previously subscribed symbol must never drive this
-            # position's stop/target or entry-price fallback.
-            if tick_symbol and tick_symbol != self.symbol:
+            # position's stop/target or entry-price fallback. Fail CLOSED:
+            # a tick without a symbol field is dropped too -- if it slipped
+            # through after a failed unsubscribe it could belong to the old
+            # symbol, and the REST check each cycle covers the gap anyway.
+            if tick_symbol != self.symbol:
                 return
             ltp = float(payload.get("ltp", 0) or 0)
             if ltp > 0:
