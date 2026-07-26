@@ -28,6 +28,7 @@ from four_ema_retracement_strategy import (
     is_red,
     manage_position,
     touched_any_ema,
+    update_trailing_stop,
 )
 
 
@@ -240,6 +241,58 @@ class TestManagePosition:
     def test_custom_r_multiples(self):
         assert manage_position(LONG, 100.0, 1.0, 102.0, False, 2.0, 4.0) == "SET_BREAKEVEN"
         assert manage_position(LONG, 100.0, 1.0, 104.0, False, 2.0, 4.0) == "TARGET"
+
+
+class TestUpdateTrailingStop:
+    # LONG at 100, risk 1.0, initial stop 99, breakeven_r 1.5, trail_r 1.0
+
+    def test_untouched_below_breakeven_move(self):
+        # extreme 101.4 -> move 1.4R < 1.5R: keep the focus-candle stop
+        assert update_trailing_stop(LONG, 100.0, 1.0, 101.4, 99.0) == 99.0
+
+    def test_activates_at_breakeven_move(self):
+        # extreme 101.5 -> stop = max(entry, 101.5 - 1.0) = 100.5
+        assert update_trailing_stop(LONG, 100.0, 1.0, 101.5, 99.0) == 100.5
+
+    def test_floors_at_cost(self):
+        # trail_r 2.0: candidate 99.5 < entry -> floored at cost 100.0
+        assert update_trailing_stop(LONG, 100.0, 1.0, 101.5, 99.0, 1.5, 2.0) == 100.0
+
+    def test_ratchets_up_with_extreme(self):
+        stop = update_trailing_stop(LONG, 100.0, 1.0, 103.0, 99.0)  # 102.0
+        assert stop == 102.0
+        stop = update_trailing_stop(LONG, 100.0, 1.0, 105.0, stop)  # 104.0
+        assert stop == 104.0
+
+    def test_never_loosens(self):
+        # extreme retreats (price pulled back): stop must not go back down
+        assert update_trailing_stop(LONG, 100.0, 1.0, 103.0, 104.0) == 104.0
+
+    def test_winner_runs_past_fixed_target(self):
+        # At 6R extreme the trailing stop locks in 5R -- more than the fixed
+        # 3R target ever pays; no exit is forced while the trend runs.
+        stop = update_trailing_stop(LONG, 100.0, 1.0, 106.0, 99.0)
+        assert stop == 105.0
+        assert not check_stop(LONG, 105.5, stop)  # still in the trade
+        assert check_stop(LONG, 105.0, stop)  # exits only on the giveback
+
+    def test_short_mirror(self):
+        # SHORT at 100, risk 1.0, initial stop 101
+        assert update_trailing_stop(SHORT, 100.0, 1.0, 98.6, 101.0) == 101.0  # 1.4R
+        assert update_trailing_stop(SHORT, 100.0, 1.0, 98.5, 101.0) == 99.5
+        stop = update_trailing_stop(SHORT, 100.0, 1.0, 96.0, 101.0)
+        assert stop == 97.0
+        assert update_trailing_stop(SHORT, 100.0, 1.0, 97.5, stop) == 97.0  # no loosen
+
+    def test_short_floors_at_cost(self):
+        assert update_trailing_stop(SHORT, 100.0, 1.0, 98.5, 101.0, 1.5, 2.0) == 100.0
+
+    def test_zero_risk_is_noop(self):
+        assert update_trailing_stop(LONG, 100.0, 0.0, 150.0, 99.0) == 99.0
+
+    def test_custom_trail_distance(self):
+        # trail_r 0.5 hugs the extreme tighter
+        assert update_trailing_stop(LONG, 100.0, 1.0, 103.0, 99.0, 1.5, 0.5) == 102.5
 
 
 class TestCheckStop:

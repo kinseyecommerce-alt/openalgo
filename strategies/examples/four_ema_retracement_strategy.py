@@ -83,6 +83,14 @@ MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "0.01"))
 BREAKEVEN_R = float(os.getenv("BREAKEVEN_R", "1.5"))
 TARGET_R = float(os.getenv("TARGET_R", "3.0"))
 
+# Exit style:
+#   TRAIL  (default) - after the breakeven point the stop RATCHETS behind the
+#            best price reached (trail distance = TRAIL_R x initial risk),
+#            letting a winner run for the whole move instead of capping it.
+#   TARGET - the original playbook exit: book profits at TARGET_R x risk.
+EXIT_MODE = os.getenv("EXIT_MODE", "TRAIL").upper()
+TRAIL_R = float(os.getenv("TRAIL_R", "1.0"))
+
 TRADE_DIRECTION = os.getenv("TRADE_DIRECTION", "BOTH").upper()
 LOOKBACK_DAYS = max(2, min(30, int(os.getenv("LOOKBACK_DAYS", "10"))))
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "20"))
@@ -262,6 +270,37 @@ def manage_position(
     return None
 
 
+def update_trailing_stop(
+    side: str,
+    entry: float,
+    initial_risk: float,
+    extreme: float,
+    current_stop: float,
+    breakeven_r: float = 1.5,
+    trail_r: float = 1.0,
+) -> float:
+    """Ratcheting trailing stop -- returns the new stop, never a looser one.
+
+    `extreme` is the best price reached since entry (highest for LONG,
+    lowest for SHORT). Until the move reaches breakeven_r x risk the stop is
+    untouched (the initial focus-candle stop protects the trade). From there
+    the stop trails the extreme by trail_r x risk, floored at cost, and only
+    ever tightens -- so a winner keeps running until the trend actually gives
+    back the trail distance, capturing the whole move.
+    """
+    if initial_risk <= 0:
+        return current_stop
+    move = (extreme - entry) if side == LONG else (entry - extreme)
+    if move < breakeven_r * initial_risk:
+        return current_stop
+    trail_distance = trail_r * initial_risk
+    if side == LONG:
+        candidate = max(entry, round(extreme - trail_distance, 2))
+        return max(current_stop, candidate)
+    candidate = min(entry, round(extreme + trail_distance, 2))
+    return min(current_stop, candidate)
+
+
 def check_stop(side: str, ltp: float, stop: float) -> bool:
     """True when the stop is hit."""
     if side == LONG:
@@ -291,6 +330,7 @@ class FourEmaRetracementBot:
         self.entry_price = 0.0
         self.stop_price = 0.0
         self.initial_risk = 0.0
+        self.extreme_price = 0.0  # best price since entry (trailing anchor)
         self.breakeven_done = False
         self.armed = False
 
@@ -503,6 +543,7 @@ class FourEmaRetracementBot:
             self.initial_risk = 0.0
             self.armed = False
             log("WARNING: no entry price available - stop management disarmed")
+        self.extreme_price = entry_price
         self.breakeven_done = False
         self.state = side  # publish last
 
@@ -512,6 +553,7 @@ class FourEmaRetracementBot:
         self.armed = False
         self.breakeven_done = False
         self.entry_price = self.stop_price = self.initial_risk = 0.0
+        self.extreme_price = 0.0
         self.position_qty = QUANTITY
         self.ltp = 0.0
 
@@ -663,30 +705,59 @@ class FourEmaRetracementBot:
             log(f"LTP handler error: {e}")
 
     def _risk_check(self, price: float):
-        """Stop / breakeven / target management. Called from WS and poll loop."""
+        """Stop / breakeven / trailing / target management (WS and poll loop)."""
         if self.state == FLAT or not self.armed or price <= 0:
             return
         if check_stop(self.state, price, self.stop_price):
             self.exit_position("stoploss")
             return
-        action = manage_position(
+
+        # Track the best price reached since entry (the trailing anchor).
+        if self.state == LONG:
+            self.extreme_price = max(self.extreme_price, price)
+        else:
+            self.extreme_price = min(self.extreme_price, price) if self.extreme_price else price
+
+        if EXIT_MODE == "TARGET":
+            action = manage_position(
+                self.state,
+                self.entry_price,
+                self.initial_risk,
+                price,
+                self.breakeven_done,
+                BREAKEVEN_R,
+                TARGET_R,
+            )
+            if action == "TARGET":
+                self.exit_position(f"target {TARGET_R}R")
+            elif action == "SET_BREAKEVEN":
+                self.stop_price = self.entry_price
+                self.breakeven_done = True
+                log(
+                    f"{self.symbol}: {BREAKEVEN_R}R reached - stop moved to cost "
+                    f"({self.stop_price:.2f})"
+                )
+            return
+
+        # TRAIL mode: ratchet the stop behind the extreme; no profit cap.
+        new_stop = update_trailing_stop(
             self.state,
             self.entry_price,
             self.initial_risk,
-            price,
-            self.breakeven_done,
+            self.extreme_price,
+            self.stop_price,
             BREAKEVEN_R,
-            TARGET_R,
+            TRAIL_R,
         )
-        if action == "TARGET":
-            self.exit_position(f"target {TARGET_R}R")
-        elif action == "SET_BREAKEVEN":
-            self.stop_price = self.entry_price
-            self.breakeven_done = True
-            log(
-                f"{self.symbol}: {BREAKEVEN_R}R reached - stop moved to cost "
-                f"({self.stop_price:.2f})"
-            )
+        if new_stop != self.stop_price:
+            # Log meaningful ratchets only, so a fast tape does not spam the
+            # strategy log with sub-tick stop updates.
+            if abs(new_stop - self.stop_price) >= max(0.05, 0.1 * self.initial_risk):
+                log(
+                    f"{self.symbol}: trailing stop {self.stop_price:.2f} -> "
+                    f"{new_stop:.2f} (extreme {self.extreme_price:.2f})"
+                )
+            self.stop_price = new_stop
 
     def start_ltp_feed(self, symbol: str):
         """Subscribe the feed to `symbol`, reusing ONE connection and dropping
@@ -790,13 +861,22 @@ class FourEmaRetracementBot:
         if direction != TRADE_DIRECTION:
             log(f"WARNING: invalid TRADE_DIRECTION {TRADE_DIRECTION!r}, using BOTH")
 
+        if EXIT_MODE == "TARGET":
+            exit_desc = f"fixed target {TARGET_R}R (breakeven at {BREAKEVEN_R}R)"
+        else:
+            if EXIT_MODE != "TRAIL":
+                log(f"WARNING: invalid EXIT_MODE {EXIT_MODE!r}, using TRAIL")
+            exit_desc = (
+                f"trailing stop {TRAIL_R}R behind the extreme from {BREAKEVEN_R}R "
+                f"(no profit cap - winners run)"
+            )
         log(
             f"Four-EMA retracement starting: {len(self.watchlist)} symbols on "
             f"{EXCHANGE} {CANDLE_TIMEFRAME}, EMAs {EMA_PERIODS}, "
             f"RSI gate {RSI_BUY_SUPPORT}/{RSI_SELL_RESISTANCE}, "
             f"risk cap {MAX_RISK_PCT * 100:.1f} pct, qty={QUANTITY}, "
-            f"direction={direction}, entries until {ENTRY_CUTOFF_TIME}, "
-            f"square-off {SQUARE_OFF_TIME} IST"
+            f"direction={direction}, exit: {exit_desc}, "
+            f"entries until {ENTRY_CUTOFF_TIME}, square-off {SQUARE_OFF_TIME} IST"
         )
         self.reconcile_position()
 
