@@ -11,6 +11,7 @@ export interface PythonStrategy {
   last_started: string | null
   last_stopped: string | null
   error_message: string | null
+  is_running?: boolean
   is_scheduled: boolean
   manually_stopped?: boolean
   schedule_start_time: string | null
