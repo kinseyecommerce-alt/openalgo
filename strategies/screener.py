@@ -47,17 +47,62 @@ IST = ZoneInfo("Asia/Kolkata")
 # NSE liquid-F&O default universe -- mirrors the scanning strategies' fallback.
 # This is a STARTER set only: supply a real universe with --universe-file for
 # a meaningful screen.
+# Broad NSE large-cap universe the screener RANKS DOWN (by liquidity +
+# volatility) into the written NSE.txt. This is the input pool, not the final
+# scan list - top results are selected by --top. The Nifty 50 constituents are
+# used as a sensible, liquid default when no --universe/--universe-file is
+# given; all are pure equity symbols (no expiries). Override with
+# --universe-file for a wider pool (e.g. Nifty 200/500).
 DEFAULT_NSE_UNIVERSE = [
-    "RELIANCE",
-    "HDFCBANK",
-    "ICICIBANK",
-    "INFY",
-    "TCS",
-    "SBIN",
+    "ADANIENT",
+    "ADANIPORTS",
+    "APOLLOHOSP",
+    "ASIANPAINT",
     "AXISBANK",
-    "LT",
+    "BAJAJ-AUTO",
+    "BAJFINANCE",
+    "BAJAJFINSV",
+    "BEL",
+    "BHARTIARTL",
+    "BPCL",
+    "BRITANNIA",
+    "CIPLA",
+    "COALINDIA",
+    "DRREDDY",
+    "EICHERMOT",
+    "GRASIM",
+    "HCLTECH",
+    "HDFCBANK",
+    "HDFCLIFE",
+    "HEROMOTOCO",
+    "HINDALCO",
+    "HINDUNILVR",
+    "ICICIBANK",
+    "INDUSINDBK",
+    "INFY",
     "ITC",
+    "JSWSTEEL",
+    "KOTAKBANK",
+    "LT",
+    "M&M",
+    "MARUTI",
+    "NESTLEIND",
+    "NTPC",
+    "ONGC",
+    "POWERGRID",
+    "RELIANCE",
+    "SBILIFE",
+    "SBIN",
+    "SHRIRAMFIN",
+    "SUNPHARMA",
+    "TATACONSUM",
     "TATAMOTORS",
+    "TATASTEEL",
+    "TCS",
+    "TECHM",
+    "TITAN",
+    "ULTRACEMCO",
+    "WIPRO",
 ]
 
 VALID_SORT_KEYS = ("atr_pct", "adr_pct", "avg_turnover", "avg_volume")

@@ -81,6 +81,11 @@ EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NSE"))
 # stocks; scanning is capped to respect API rate limits. MCX symbols carry
 # expiries (e.g. CRUDEOILM20MAY24FUT) so there is NO safe hardcoded MCX
 # watchlist: with EXCHANGE=MCX and WATCHLIST unset the engine scans nothing.
+# Fallback NSE universe used only when WATCHLIST is unset and no screened
+# strategies/watchlists/NSE.txt exists yet. Sized to MAX_SCAN_SYMBOLS (20) so
+# the whole scan budget is used with no truncation - these are the most liquid
+# large-caps (pure equity, no expiries). Once the pre-market screener runs it
+# writes a ranked NSE.txt that takes precedence over this list.
 DEFAULT_NSE_WATCHLIST = [
     "RELIANCE",
     "HDFCBANK",
@@ -92,6 +97,16 @@ DEFAULT_NSE_WATCHLIST = [
     "LT",
     "ITC",
     "TATAMOTORS",
+    "BHARTIARTL",
+    "KOTAKBANK",
+    "HINDUNILVR",
+    "BAJFINANCE",
+    "MARUTI",
+    "SUNPHARMA",
+    "HCLTECH",
+    "TITAN",
+    "NTPC",
+    "TATASTEEL",
 ]
 _WATCHLIST_ENV = os.getenv("WATCHLIST")
 # Shared loader precedence: WATCHLIST env wins (empty string -> no symbols);

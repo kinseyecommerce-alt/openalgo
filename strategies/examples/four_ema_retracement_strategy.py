@@ -78,6 +78,16 @@ DEFAULT_NSE_WATCHLIST = [
     "LT",
     "ITC",
     "TATAMOTORS",
+    "BHARTIARTL",
+    "KOTAKBANK",
+    "HINDUNILVR",
+    "BAJFINANCE",
+    "MARUTI",
+    "SUNPHARMA",
+    "HCLTECH",
+    "TITAN",
+    "NTPC",
+    "TATASTEEL",
 ]
 WATCHLIST = load_watchlist(EXCHANGE, DEFAULT_NSE_WATCHLIST, os.getenv("WATCHLIST"))
 MAX_SCAN_SYMBOLS = 20
