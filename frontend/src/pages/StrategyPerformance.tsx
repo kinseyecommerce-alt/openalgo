@@ -97,6 +97,10 @@ export default function StrategyPerformance() {
   const chartContainerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Area'> | null>(null)
+  // Bumped every time the chart/series is recreated (theme or currency
+  // formatter change) so the data-population effect re-runs and refills the
+  // fresh, empty series instead of leaving the curve blank until a refetch.
+  const [chartEpoch, setChartEpoch] = useState(0)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -167,6 +171,8 @@ export default function StrategyPerformance() {
     })
     chartRef.current = chart
     seriesRef.current = series
+    // Signal that a fresh (empty) series exists so the population effect refills it.
+    setChartEpoch((e) => e + 1)
 
     const handleResize = () => {
       if (chartRef.current && container) {
@@ -191,6 +197,7 @@ export default function StrategyPerformance() {
 
   // Push the portfolio cumulative equity curve into the chart whenever data or
   // the chart instance changes. Dates map to midnight-UTC timestamps.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: chartEpoch is an intentional trigger — it is not read in the body but MUST re-fire this effect when initChart recreates the (empty) series on a theme/currency-formatter change, so the curve is repopulated instead of left blank.
   useEffect(() => {
     const series = seriesRef.current
     const daily = data?.totals.daily
@@ -207,7 +214,10 @@ export default function StrategyPerformance() {
     } else {
       series.setData([])
     }
-  }, [data])
+    // chartEpoch is a dependency so that when initChart recreates the series
+    // (theme / currency-formatter change), this effect re-runs and repopulates
+    // the new, empty series rather than leaving the curve blank.
+  }, [data, chartEpoch])
 
   const totals = data?.totals
   const hasData = !!totals && totals.trade_count > 0
@@ -321,8 +331,8 @@ export default function StrategyPerformance() {
           <CardContent className="flex items-start gap-2 py-4 text-sm text-amber-700 dark:text-amber-400">
             <Info className="mt-0.5 h-4 w-4 shrink-0" />
             <span>
-              Live mode shows the current trading day only. Broker fills are available for today
-              and are not stored historically, so this range reflects at most today&apos;s trades.
+              Live mode shows the current trading day only. Broker fills are available for today and
+              are not stored historically, so this range reflects at most today&apos;s trades.
               Switch to Analyzer (sandbox) mode for a full multi-day track record.
             </span>
           </CardContent>
@@ -391,8 +401,9 @@ export default function StrategyPerformance() {
                 <p className="mt-2 flex items-start gap-1.5 text-xs text-muted-foreground">
                   <Info className="mt-0.5 h-3 w-3 shrink-0" />
                   <span>
-                    Portfolio includes {formatSigned(data.untagged_pnl)} of untagged / manual
-                    P&amp;L not attributed to any strategy below.
+                    This portfolio total <strong>excludes</strong> {formatSigned(data.untagged_pnl)}{' '}
+                    of untagged / manual P&amp;L not attributed to any strategy. Only
+                    tagged-strategy trades are counted in the tiles and curve above.
                   </span>
                 </p>
               )}

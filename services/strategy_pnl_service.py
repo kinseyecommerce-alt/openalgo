@@ -62,6 +62,10 @@ def attribute_fills(orders_by_orderid, fills):
                     "strategy": strategy or "",
                     "symbol": fill.get("symbol", ""),
                     "exchange": fill.get("exchange", ""),
+                    # Product (CNC/NRML/MIS) keeps independent product positions
+                    # on the same symbol from being netted together (a CNC long
+                    # and an MIS short are two positions, not a round-trip).
+                    "product": str(fill.get("product", "") or ""),
                     "action": str(fill.get("action", "")).upper(),
                     "quantity": qty,
                     "price": price,
@@ -151,19 +155,26 @@ def aggregate_strategy_pnl(attributed_fills, positions_ltp):
 
     positions_ltp = positions_ltp or {}
 
-    # Group fills by (strategy, symbol, exchange).
+    # Group fills by (strategy, symbol, exchange, product). Product is part of
+    # the key so a CNC and an MIS position on the same symbol never net into a
+    # phantom round-trip - they are independent positions.
     groups = {}
     for fill in attributed_fills:
         qty = int(fill.get("quantity", 0) or 0)
         price = float(fill.get("price", 0) or 0)
         if qty <= 0 or price <= 0:
             continue
-        key = (fill.get("strategy", ""), fill.get("symbol", ""), fill.get("exchange", ""))
+        key = (
+            fill.get("strategy", ""),
+            fill.get("symbol", ""),
+            fill.get("exchange", ""),
+            fill.get("product", ""),
+        )
         groups.setdefault(key, []).append(fill)
 
     # Accumulate per strategy.
     per_strategy = {}
-    for (strategy, _symbol, _exchange), fills in groups.items():
+    for (strategy, _symbol, _exchange, _product), fills in groups.items():
         netted = _net_group(fills, positions_ltp)
         acc = per_strategy.setdefault(
             strategy,
@@ -236,7 +247,12 @@ def _round_trip_stats(attributed_fills, positions_ltp):
         price = float(fill.get("price", 0) or 0)
         if qty <= 0 or price <= 0:
             continue
-        key = (fill.get("strategy", ""), fill.get("symbol", ""), fill.get("exchange", ""))
+        key = (
+            fill.get("strategy", ""),
+            fill.get("symbol", ""),
+            fill.get("exchange", ""),
+            fill.get("product", ""),
+        )
         groups.setdefault(key, []).append(fill)
 
     wins = losses = open_positions = 0
@@ -353,6 +369,7 @@ def build_attributed_fills_live(user_id, day):
                             else None,
                             "symbol": trade.get("symbol", ""),
                             "exchange": trade.get("exchange", ""),
+                            "product": trade.get("product", ""),
                             "action": trade.get("action", ""),
                             "quantity": trade.get("quantity", 0),
                             "price": trade.get("average_price", 0),
@@ -401,6 +418,7 @@ def build_attributed_fills_sandbox(user_id, day):
                             "orderid": row.orderid,
                             "symbol": row.symbol,
                             "exchange": row.exchange,
+                            "product": getattr(row, "product", "") or "",
                             "action": row.action,
                             "quantity": int(row.quantity),
                             "price": float(row.price),
@@ -423,6 +441,7 @@ def build_attributed_fills_sandbox(user_id, day):
                     "strategy": r["strategy"],
                     "symbol": r["symbol"],
                     "exchange": r["exchange"],
+                    "product": r.get("product", ""),
                     "action": str(r["action"]).upper(),
                     "quantity": qty,
                     "price": price,

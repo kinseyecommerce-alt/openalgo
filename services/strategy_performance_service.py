@@ -11,13 +11,13 @@ in the range, reuses the tested per-day netting machinery in
 ``services.strategy_pnl_service`` to attribute and net fills, and feeds the
 resulting daily series + closed round-trips into the pure core.
 
-Reuse (no netting re-implemented here):
+Reuse + netting:
 - ``build_attributed_fills_live`` / ``build_attributed_fills_sandbox`` produce
-  the day's attributed fills.
-- ``_net_group(fills, {})`` nets one (strategy, symbol) group for a COMPLETED
-  past day: with ``positions_ltp={}`` there is no open leg to mark, so for an
-  intraday (MIS) day that squares off, ``realized`` is that group's whole-day
-  P&L and ``matched > 0`` flags a closed round-trip.
+  each day's attributed fills (now carrying ``product``).
+- ``net_fills_chronological`` nets those fills across the whole range with a
+  cross-day, per-product running average-cost inventory, so a position opened
+  one day and closed another is counted (per-day netting would miss it) and a
+  CNC long never nets against an MIS short on the same symbol.
 """
 
 from datetime import date, datetime, timedelta
@@ -25,7 +25,6 @@ from datetime import date, datetime, timedelta
 import pytz
 
 from services.strategy_pnl_service import (
-    _net_group,
     build_attributed_fills_live,
     build_attributed_fills_sandbox,
 )
@@ -169,6 +168,126 @@ def summarize_performance(daily_pnl, trade_results):
     }
 
 
+def net_fills_chronological(dated_fills):
+    """Net attributed fills across a date range with cross-day, per-product
+    running inventory (pure).
+
+    Processes fills in ascending day order (stable within a day), maintaining a
+    signed average-cost position per ``(strategy, symbol, exchange, product)``.
+    Each reducing/closing fill realizes P&L attributed to *that fill's day*;
+    when a position returns to flat (or flips through zero) one round-trip
+    result -- its accumulated realized since the position was opened -- is
+    emitted, attributed to the closing day.
+
+    Why chronological (not per-day) netting:
+    - Cross-day carry: an Analyzer CNC/NRML position opened one day and closed
+      another is counted correctly. Per-day netting would see only buys on the
+      open day and only sells on the close day, report ``matched == 0`` on both,
+      and silently omit the completed trade.
+    - Per-product isolation: product is part of the position key, so a CNC long
+      and an MIS short on the same symbol are two independent positions, never a
+      phantom round-trip.
+
+    Boundaries (kept honest, not hidden):
+    - Positions still open at the end of the range contribute no realized P&L
+      here -- this is a realized track record; unrealized is not marked.
+    - A closing fill for a position opened BEFORE the first in-range fill has no
+      in-range cost basis; it opens a fresh position at its own price rather than
+      matching a phantom. Full history for long carries needs fills from before
+      the queried window.
+
+    Args:
+        dated_fills: list of dicts ``{strategy, symbol, exchange, product,
+            action (BUY/SELL), quantity, price, day ("YYYY-MM-DD")}``.
+
+    Returns:
+        ``(strat_daily, strat_trades, untagged_daily)`` where
+        - ``strat_daily``: ``{strategy: {day: {"pnl": float, "trades": int}}}``
+          -- ``pnl`` is realized attributed to that day (full precision),
+          ``trades`` is the number of fills that day.
+        - ``strat_trades``: ``{strategy: [round_trip_realized, ...]}`` for TAGGED
+          strategies only (the closed round-trips feeding win/loss stats).
+        - ``untagged_daily``: ``{day: float}`` realized for the ``""`` strategy.
+    """
+    ordered = sorted((dated_fills or []), key=lambda f: f.get("day", ""))
+
+    inv = {}  # (strategy, symbol, exchange, product) -> {qty, avg, realized}
+    strat_daily = {}
+    strat_trades = {}
+    untagged_daily = {}
+
+    def _daily(strategy, day):
+        return strat_daily.setdefault(strategy, {}).setdefault(
+            day, {"pnl": 0.0, "trades": 0}
+        )
+
+    for f in ordered:
+        try:
+            qty = int(f.get("quantity", 0) or 0)
+            price = float(f.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0 or price <= 0:
+            continue
+
+        strategy = f.get("strategy", "") or ""
+        day = f.get("day", "")
+        action = str(f.get("action", "")).upper()
+        key = (strategy, f.get("symbol", ""), f.get("exchange", ""), f.get("product", ""))
+
+        # Every valid fill counts on its day, open or close.
+        _daily(strategy, day)["trades"] += 1
+
+        pos = inv.setdefault(key, {"qty": 0, "avg": 0.0, "realized": 0.0})
+        delta = qty if action == "BUY" else -qty
+        realized = 0.0
+
+        if pos["qty"] == 0:
+            pos["qty"] = delta
+            pos["avg"] = price
+            pos["realized"] = 0.0
+        elif (pos["qty"] > 0) == (delta > 0):
+            # Extend the same side -> roll the average cost.
+            total_abs = abs(pos["qty"]) + qty
+            pos["avg"] = (pos["avg"] * abs(pos["qty"]) + price * qty) / total_abs
+            pos["qty"] += delta
+        else:
+            # Reduce / close / flip against the open side.
+            was_long = pos["qty"] > 0
+            close_qty = min(qty, abs(pos["qty"]))
+            realized = (
+                close_qty * (price - pos["avg"])
+                if was_long
+                else close_qty * (pos["avg"] - price)
+            )
+            pos["realized"] += realized
+            pos["qty"] += delta
+
+            if pos["qty"] == 0:
+                # Round-trip complete.
+                if strategy:
+                    strat_trades.setdefault(strategy, []).append(pos["realized"])
+                pos["avg"] = 0.0
+                pos["realized"] = 0.0
+            elif (pos["qty"] > 0) == was_long:
+                # Partial close, still on the original side: keep avg + accum.
+                pass
+            else:
+                # Flipped through zero: old round-trip done, new position opened
+                # with the leftover quantity at this fill's price.
+                if strategy:
+                    strat_trades.setdefault(strategy, []).append(pos["realized"])
+                pos["avg"] = price
+                pos["realized"] = 0.0
+
+        if realized:
+            _daily(strategy, day)["pnl"] += realized
+            if not strategy:
+                untagged_daily[day] = untagged_daily.get(day, 0.0) + realized
+
+    return strat_daily, strat_trades, untagged_daily
+
+
 def resolve_range(days=None, start=None, end=None):
     """Resolve a validated ``(start_date, end_date)`` window (pure).
 
@@ -243,12 +362,14 @@ def _iter_days(start_date, end_date):
 def get_strategy_performance(user_id, start_date, end_date):
     """Compute per-strategy and portfolio performance over a date range.
 
-    Walks each IST calendar day in ``[start_date, end_date]`` (inclusive),
-    building that day's attributed fills from the live or sandbox source per
-    ``get_analyze_mode``. For a completed past day the netting squares off, so
-    each ``(strategy, symbol)`` group's ``realized`` (netted with
-    ``positions_ltp={}``) is that day's P&L for the group and a closed
-    round-trip when ``matched > 0``.
+    Gathers every IST calendar day's attributed fills in
+    ``[start_date, end_date]`` (inclusive) from the live or sandbox source per
+    ``get_analyze_mode``, tags each fill with its day, and nets the whole range
+    with ``net_fills_chronological`` -- a cross-day, per-product running
+    average-cost inventory. Realized P&L is attributed to the day the closing
+    fill occurs, and each closed round-trip feeds the win/loss stats. This
+    counts positions carried across day boundaries and never nets two different
+    products on the same symbol together.
 
     The untagged ``""`` strategy is excluded from ``per_strategy`` and surfaced
     separately as ``untagged_pnl``. Never raises; on error returns an error
@@ -291,72 +412,35 @@ def get_strategy_performance(user_id, start_date, end_date):
 
         builder = build_attributed_fills_sandbox if analyze else build_attributed_fills_live
 
-        # Per-strategy accumulators over the whole range.
-        # strat_daily[name] = {date_str: {"pnl": float, "trades": int}}
-        strat_daily = {}
-        # strat_trades[name] = list[float]  (closed round-trip realized P&L)
-        strat_trades = {}
-        # portfolio_daily[date_str] = float  (sum of tagged strategy P&L that day)
-        portfolio_daily = {}
-        portfolio_trades = []
-        untagged_pnl = 0.0
-        trading_days = 0
-
+        # Gather every day's attributed fills, tagging each with its day, then
+        # net the whole range chronologically (cross-day carry, per-product).
+        dated_fills = []
+        days_with_fills = set()
         for day in _iter_days(start_date, end_date):
             attributed_fills = builder(user_id, day)
             if not attributed_fills:
                 # Not a trading day for these strategies.
                 continue
-
             day_str = day.strftime("%Y-%m-%d")
-
-            # Group the day's fills by (strategy, symbol, exchange), then net
-            # each group for the completed past day (no open leg to mark).
-            groups = {}
+            days_with_fills.add(day_str)
             for fill in attributed_fills:
-                qty = int(fill.get("quantity", 0) or 0)
-                price = float(fill.get("price", 0) or 0)
-                if qty <= 0 or price <= 0:
-                    continue
-                key = (
-                    fill.get("strategy", ""),
-                    fill.get("symbol", ""),
-                    fill.get("exchange", ""),
-                )
-                groups.setdefault(key, []).append(fill)
+                nf = dict(fill)
+                nf["day"] = day_str
+                dated_fills.append(nf)
 
-            # Per-strategy realized total for this day + fill counts.
-            day_realized = {}  # strategy -> realized sum
-            day_fill_count = {}  # strategy -> number of fills
-            for f in attributed_fills:
-                strat = f.get("strategy", "")
-                day_fill_count[strat] = day_fill_count.get(strat, 0) + 1
+        strat_daily, strat_trades, untagged_daily = net_fills_chronological(dated_fills)
+        trading_days = len(days_with_fills)
+        untagged_pnl = round(sum(untagged_daily.values()), 2)
 
-            for (strategy, _symbol, _exchange), fills in groups.items():
-                netted = _net_group(fills, {})
-                day_realized[strategy] = day_realized.get(strategy, 0.0) + netted["realized"]
-                # A closed round-trip contributes a per-trade result.
-                if netted["matched"] > 0:
-                    if strategy:
-                        strat_trades.setdefault(strategy, []).append(netted["realized"])
-                        portfolio_trades.append(netted["realized"])
-
-            trading_days += 1
-
-            for strategy, realized in day_realized.items():
-                if not strategy:
-                    # Untagged/manual account activity - surfaced separately.
-                    untagged_pnl += realized
-                    continue
-                strat_daily.setdefault(strategy, {})[day_str] = {
-                    "pnl": realized,
-                    "trades": day_fill_count.get(strategy, 0),
-                }
-                portfolio_daily[day_str] = portfolio_daily.get(day_str, 0.0) + realized
-
-        # Build per-strategy summaries.
+        # Build per-strategy summaries (exclude the untagged "" bucket) and, in
+        # the same pass, accumulate the portfolio daily series over tagged
+        # strategies only.
         per_strategy = {}
+        portfolio_daily = {}  # date_str -> summed tagged realized that day
+        portfolio_trades = []
         for strategy, day_map in strat_daily.items():
+            if not strategy:
+                continue
             daily_series = [
                 {"date": d, "pnl": day_map[d]["pnl"], "trades": day_map[d]["trades"]}
                 for d in sorted(day_map.keys())
@@ -364,8 +448,11 @@ def get_strategy_performance(user_id, start_date, end_date):
             per_strategy[strategy] = summarize_performance(
                 daily_series, strat_trades.get(strategy, [])
             )
+            for d, v in day_map.items():
+                portfolio_daily[d] = portfolio_daily.get(d, 0.0) + v["pnl"]
+            portfolio_trades.extend(strat_trades.get(strategy, []))
 
-        # Portfolio totals: one entry per day summed across strategies.
+        # Portfolio totals: one entry per day summed across tagged strategies.
         portfolio_series = [
             {
                 "date": d,
@@ -373,7 +460,7 @@ def get_strategy_performance(user_id, start_date, end_date):
                 "trades": sum(
                     strat_daily[s][d]["trades"]
                     for s in strat_daily
-                    if d in strat_daily[s]
+                    if s and d in strat_daily[s]
                 ),
             }
             for d in sorted(portfolio_daily.keys())
@@ -392,7 +479,7 @@ def get_strategy_performance(user_id, start_date, end_date):
                 "live_partial": live_partial,
                 "per_strategy": per_strategy,
                 "totals": totals,
-                "untagged_pnl": round(untagged_pnl, 2),
+                "untagged_pnl": untagged_pnl,
             },
         }
     except Exception as e:
