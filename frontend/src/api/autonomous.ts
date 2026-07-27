@@ -82,6 +82,36 @@ export interface RiskUpdate {
   flatten_on_halt?: boolean
 }
 
+// Historical per-strategy track-record analytics (Strategy Performance page).
+// Attributed from tagged orders — reflects actual executed trades (live or
+// sandbox). profit_factor is null when there are no losing trades.
+export interface PerfSummary {
+  total_pnl: number
+  trading_days: number
+  trade_count: number
+  win_trades: number
+  loss_trades: number
+  win_rate: number
+  avg_win: number
+  avg_loss: number
+  profit_factor: number | null
+  win_days: number
+  loss_days: number
+  best_day: { date: string; pnl: number } | null
+  worst_day: { date: string; pnl: number } | null
+  max_drawdown: number
+  cumulative: number
+  daily: Array<{ date: string; pnl: number; cumulative: number; trades: number }>
+}
+
+export interface StrategyPerformanceData {
+  range: { start: string; end: string; trading_days: number }
+  mode: 'live' | 'analyzer'
+  untagged_pnl: number
+  totals: PerfSummary
+  per_strategy: Record<string, PerfSummary>
+}
+
 export const autonomousApi = {
   /**
    * Per-strategy and portfolio P&L for the logged-in user.
@@ -136,6 +166,23 @@ export const autonomousApi = {
    */
   resetRisk: async (): Promise<ApiResponse<RiskStatus>> => {
     const response = await webClient.post<ApiResponse<RiskStatus>>('/python/api/risk/reset', {})
+    return response.data
+  },
+
+  /**
+   * Historical per-strategy track record over a date range. Session route
+   * (webClient). Pass either `days` (rolling window) or an explicit
+   * `start`/`end` (YYYY-MM-DD). Detects live vs analyzer mode server-side.
+   */
+  getStrategyPerformance: async (params?: {
+    days?: number
+    start?: string
+    end?: string
+  }): Promise<ApiResponse<StrategyPerformanceData>> => {
+    const response = await webClient.get<ApiResponse<StrategyPerformanceData>>(
+      '/python/api/strategy-performance',
+      { params }
+    )
     return response.data
   },
 }

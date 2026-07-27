@@ -2559,6 +2559,41 @@ def api_strategy_pnl():
     return jsonify(result), status_code
 
 
+@python_strategy_bp.route("/api/strategy-performance")
+@check_session_validity
+def api_strategy_performance():
+    """API: Historical per-strategy and portfolio performance as JSON.
+
+    Aggregates ACTUAL executed trades over a date range into a track record:
+    total P&L, win rate, profit factor, best/worst day, max drawdown, and a
+    daily cumulative curve. Detects live vs analyzer (sandbox) mode server-side.
+
+    Query params: ``?days=30`` (trailing window, default 30) OR
+    ``?start=YYYY-MM-DD&end=YYYY-MM-DD`` (explicit range). The span is clamped
+    to 180 days.
+    """
+    user_id = session.get("user")
+    if not user_id:
+        return jsonify({"status": "error", "message": "Not authenticated"}), 401
+
+    from services.strategy_performance_service import (
+        get_strategy_performance,
+        resolve_range,
+    )
+
+    days = request.args.get("days")
+    start = request.args.get("start")
+    end = request.args.get("end")
+    try:
+        start_date, end_date = resolve_range(days=days, start=start, end=end)
+    except (ValueError, TypeError) as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    result = get_strategy_performance(user_id, start_date, end_date)
+    status_code = 200 if result.get("status") == "success" else 500
+    return jsonify(result), status_code
+
+
 def _live_portfolio_day_pnl(user_id):
     """Compute the account intraday P&L for the risk-status routes.
 
