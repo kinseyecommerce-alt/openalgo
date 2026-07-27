@@ -266,17 +266,39 @@ def _day_bounds(day):
 def build_attributed_fills_live(user_id, day):
     """Build attributed fills for live mode from OrderLog + the tradebook.
 
-    Reads today's ``placeorder`` / ``placesmartorder`` rows from ``order_logs``
+    Reads the day's ``placeorder`` / ``placesmartorder`` rows from ``order_logs``
     to map ``orderid`` -> ``strategy``, then joins that against the broker
     tradebook fills. All parsing is guarded; a bad row is skipped, never fatal.
 
+    IMPORTANT - live fills exist only for the CURRENT trading day. The broker
+    tradebook API (``get_tradebook``) is not date-parameterised: it always
+    returns the *current* day's fills and the broker resets it daily (~3 AM IST).
+    OpenAlgo does not persist live executed fill prices historically (the
+    ``placeorder`` response carries only the ``orderid``, never the average fill
+    price). Joining a past day's ``order_logs`` against today's tradebook would
+    therefore fabricate a track record. To make that structurally impossible,
+    this function returns ``[]`` for any ``day`` that is not today (IST). Live
+    per-day history beyond today is unavailable by design; the analyzer/sandbox
+    path (``build_attributed_fills_sandbox``) persists every trade with its price
+    and so supports the full historical range.
+
     Args:
         user_id: OpenAlgo session user id.
-        day: ``datetime.date`` (IST) to read orders for.
+        day: ``datetime.date`` (IST) to read orders for. Must be today (IST) to
+            yield fills; any earlier/later day yields ``[]``.
 
     Returns:
         List of attributed fill dicts (possibly empty).
     """
+    # The broker tradebook only ever holds the current trading day's fills, so a
+    # request for any other day cannot be answered from real data. Refuse rather
+    # than join stale OrderLog rows against today's tradebook (which would
+    # fabricate history). strategy-pnl only ever asks for today, so this is a
+    # no-op there. Checked BEFORE the DB/service imports so a past-day call does
+    # no I/O at all.
+    if day != datetime.now(IST).date():
+        return []
+
     import json
 
     from database.apilog_db import OrderLog, db_session

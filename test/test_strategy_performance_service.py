@@ -189,3 +189,23 @@ class TestResolveRange:
     def test_days_clamped_to_max(self):
         start, end = resolve_range(days=500)
         assert (end - start).days == MAX_RANGE_DAYS - 1
+
+
+class TestLiveFillsDayGuard:
+    """The live builder must refuse any non-today day (broker tradebook is not
+    historical), so it can never fabricate a past-day track record by joining a
+    stale OrderLog against today's tradebook. The guard returns [] BEFORE any DB
+    or network access, so this runs fully offline."""
+
+    def test_past_day_returns_empty_without_db(self):
+        from services.strategy_pnl_service import build_attributed_fills_live
+
+        yesterday = datetime.now(IST).date() - timedelta(days=1)
+        # No DB is configured for real broker/order data here; the guard must
+        # short-circuit to [] before touching the database at all.
+        assert build_attributed_fills_live("user1", yesterday) == []
+
+    def test_far_past_day_returns_empty(self):
+        from services.strategy_pnl_service import build_attributed_fills_live
+
+        assert build_attributed_fills_live("user1", date(2020, 1, 1)) == []

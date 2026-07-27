@@ -254,6 +254,12 @@ def get_strategy_performance(user_id, start_date, end_date):
     separately as ``untagged_pnl``. Never raises; on error returns an error
     envelope.
 
+    Live mode caveat: ``build_attributed_fills_live`` only returns fills for the
+    current trading day (the broker tradebook is not historical), so a live range
+    wider than today reflects at most today. The response sets
+    ``data.live_partial = True`` in that case so the UI can say so honestly;
+    analyzer/sandbox mode has the full history and never sets it.
+
     Args:
         user_id: OpenAlgo session user id.
         start_date: ``datetime.date`` (IST) inclusive range start.
@@ -274,6 +280,14 @@ def get_strategy_performance(user_id, start_date, end_date):
             return {"status": "error", "message": "start date must not be after end date"}
         if (end_date - start_date).days > MAX_RANGE_DAYS - 1:
             start_date = end_date - timedelta(days=MAX_RANGE_DAYS - 1)
+
+        # Live mode has fills only for the current trading day (the broker
+        # tradebook resets daily and OpenAlgo does not persist live fill prices
+        # historically - see build_attributed_fills_live). So a live range wider
+        # than today reflects, at most, today. Flag that honestly for the UI
+        # rather than presenting a partial window as a full track record.
+        today = datetime.now(IST).date()
+        live_partial = (not analyze) and (start_date < today <= end_date or end_date < today)
 
         builder = build_attributed_fills_sandbox if analyze else build_attributed_fills_live
 
@@ -375,6 +389,7 @@ def get_strategy_performance(user_id, start_date, end_date):
                     "trading_days": trading_days,
                 },
                 "mode": mode,
+                "live_partial": live_partial,
                 "per_strategy": per_strategy,
                 "totals": totals,
                 "untagged_pnl": round(untagged_pnl, 2),

@@ -107,6 +107,12 @@ export interface PerfSummary {
 export interface StrategyPerformanceData {
   range: { start: string; end: string; trading_days: number }
   mode: 'live' | 'analyzer'
+  // True in live mode when the requested range is wider than the current
+  // trading day. Live fills exist only for today (the broker tradebook resets
+  // daily and live fill prices are not persisted historically), so a multi-day
+  // live range reflects, at most, today. Analyzer/sandbox mode has the full
+  // history and never sets this. The UI shows an honest note when true.
+  live_partial: boolean
   untagged_pnl: number
   totals: PerfSummary
   per_strategy: Record<string, PerfSummary>

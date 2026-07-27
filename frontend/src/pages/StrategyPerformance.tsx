@@ -315,6 +315,20 @@ export default function StrategyPerformance() {
         </div>
       </div>
 
+      {/* ---- Live-mode history limitation (honest) ---- */}
+      {data?.live_partial && (
+        <Card className="border-amber-500/40 bg-amber-500/10">
+          <CardContent className="flex items-start gap-2 py-4 text-sm text-amber-700 dark:text-amber-400">
+            <Info className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>
+              Live mode shows the current trading day only. Broker fills are available for today
+              and are not stored historically, so this range reflects at most today&apos;s trades.
+              Switch to Analyzer (sandbox) mode for a full multi-day track record.
+            </span>
+          </CardContent>
+        </Card>
+      )}
+
       {/* ---- Error / unavailable state ---- */}
       {error && (
         <Card className="border-red-500/40 bg-red-500/10">
