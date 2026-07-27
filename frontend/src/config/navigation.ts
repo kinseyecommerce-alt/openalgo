@@ -2,6 +2,7 @@ import {
   BarChart3,
   Bell,
   BookOpen,
+  Bot,
   CandlestickChart,
   ClipboardList,
   Code2,
@@ -17,6 +18,7 @@ import {
   type LucideIcon,
   MessageCircle,
   MessageSquare,
+  Plug,
   Search,
   Settings,
   TrendingUp,
@@ -65,6 +67,7 @@ export const mobileSheetItems = navItems.filter((item) => !bottomNavPaths.includ
 // Profile dropdown menu items
 export const profileMenuItems: NavItem[] = [
   { href: '/profile', label: 'Profile', icon: User },
+  { href: '/settings/broker', label: 'Broker Settings', icon: Plug },
   { href: '/apikey', label: 'API Key', icon: Key },
   { href: '/action-center', label: 'Action Center', icon: Bell },
   { href: '/master-contract', label: 'Master Contract', icon: FileStack },
@@ -74,6 +77,7 @@ export const profileMenuItems: NavItem[] = [
   { href: '/flow', label: 'Flow Editor', icon: Workflow },
   { href: '/scalping', label: 'Scalping', icon: Zap },
   { href: '/python', label: 'Python Strategies', icon: Code2 },
+  { href: '/autonomous', label: 'Autonomous', icon: Bot },
   { href: '/pnl-tracker', label: 'PnL Tracker', icon: BarChart3 },
   { href: '/historify', label: 'Historify', icon: Database },
   { href: '/search/token', label: 'Search', icon: Search },

@@ -145,6 +145,18 @@ def init_scheduler():
         )
         logger.debug("Dead-process reaper scheduled (runs every 60 seconds)")
 
+        # Server-side daily-loss circuit breaker - runs every 60 seconds.
+        # Halts ALL running strategies on a portfolio day-P&L breach, with no
+        # browser required. See services/risk_monitor_service.py.
+        SCHEDULER.add_job(
+            func=risk_monitor_job,
+            trigger="interval",
+            seconds=60,
+            id="risk_monitor",
+            replace_existing=True,
+        )
+        logger.debug("Risk monitor (daily-loss circuit breaker) scheduled (runs every 60 seconds)")
+
 
 def load_configs():
     """Load strategy configurations from file. Backfills `exchange` for
@@ -1136,6 +1148,19 @@ def scheduled_start_strategy(strategy_id: str):
         )
         return
 
+    # Risk circuit breaker: refuse to auto-start while halted (prevents a
+    # halted strategy from being auto-restarted a minute later).
+    try:
+        from services.risk_monitor_service import load_risk_config
+
+        if load_risk_config().get("halted"):
+            logger.warning(
+                f"Strategy {strategy_id} scheduled start BLOCKED - risk circuit breaker active"
+            )
+            return
+    except Exception as e:
+        logger.exception(f"Risk breaker check failed for scheduled start {strategy_id}: {e}")
+
     schedule_days = [d.lower() for d in config.get("schedule_days", [])]
     if schedule_days and today_day not in schedule_days:
         logger.warning(
@@ -1186,6 +1211,158 @@ def is_trading_day_enforcement_enabled() -> bool:
     The scheduler handles start/stop times for each strategy.
     """
     return True
+
+
+# ---------------------------------------------------------------------------
+# Daily-loss circuit breaker wiring (see services/risk_monitor_service.py)
+# ---------------------------------------------------------------------------
+
+
+def _risk_breaker_halted() -> bool:
+    """True if the daily-loss circuit breaker is latched halted.
+
+    Used by the market-hours enforcer to refuse resuming a paused strategy
+    while the breaker is active (a paused-not-manually-stopped strategy must not
+    be auto-restarted with zero loss protection). Fails safe: on any error it
+    returns False so a breaker-read failure never blocks normal enforcement,
+    but such failures are logged (the breaker's own logging is loud on corrupt
+    config).
+    """
+    try:
+        from services.risk_monitor_service import load_risk_config
+
+        if load_risk_config().get("halted"):
+            logger.debug("Enforcer: risk circuit breaker halted - not resuming any strategy")
+            return True
+    except Exception as e:
+        logger.exception(f"Enforcer risk-breaker check failed: {e}")
+    return False
+
+
+def _resolve_risk_user_id():
+    """Resolve the single-user id for the server-side risk monitor.
+
+    Prefers a ``user_id`` stamped on any strategy config; falls back to the
+    admin user. Returns ``None`` if neither is available (headless, no user).
+    """
+    try:
+        for cfg in STRATEGY_CONFIGS.values():
+            uid = cfg.get("user_id")
+            if uid:
+                return uid
+    except Exception:
+        pass
+    try:
+        from database.user_db import find_user_by_username
+
+        admin = find_user_by_username()
+        if admin:
+            return admin.username
+    except Exception as e:
+        logger.warning(f"Risk monitor could not resolve admin user: {e}")
+    return None
+
+
+def _risk_stop_fn(strategy_id):
+    """Stop a strategy AND mark it manually-stopped so it will NOT auto-restart.
+
+    Mirrors the manual-stop path: ``stop_strategy_process`` + set
+    ``manually_stopped`` on the config so ``scheduled_start_strategy`` and the
+    market-hours enforcer skip it until the user explicitly restarts.
+
+    The ``manually_stopped`` flag is set in a ``finally`` so it is persisted
+    even if ``stop_strategy_process`` throws -- otherwise a failed stop would
+    leave the strategy resumable by the enforcer while the breaker is halted.
+    """
+    try:
+        stop_strategy_process(strategy_id)
+    finally:
+        if strategy_id in STRATEGY_CONFIGS:
+            STRATEGY_CONFIGS[strategy_id]["manually_stopped"] = True
+            save_configs()
+
+
+def _risk_flatten_fn():
+    """Close all open positions for the resolved user (flatten on halt)."""
+    from database.auth_db import get_api_key_for_tradingview
+    from services.close_position_service import close_position
+
+    user_id = _resolve_risk_user_id()
+    if not user_id:
+        logger.warning("Risk monitor flatten skipped: no user resolved")
+        return
+    api_key = get_api_key_for_tradingview(user_id)
+    if not api_key:
+        logger.warning("Risk monitor flatten skipped: no API key for user")
+        return
+    success, response, status_code = close_position(api_key=api_key)
+    logger.warning(f"Risk monitor flatten result: success={success} status={status_code}")
+
+
+def _risk_notify_fn(message):
+    """Best-effort Telegram alert on halt. Never fatal."""
+    try:
+        from database.telegram_db import get_telegram_user_by_username
+        from services.telegram_alert_service import alert_executor, telegram_alert_service
+
+        if not telegram_alert_service.is_bot_active():
+            return
+        user_id = _resolve_risk_user_id()
+        if not user_id:
+            return
+        telegram_user = get_telegram_user_by_username(user_id)
+        if not telegram_user or not telegram_user.get("notifications_enabled"):
+            return
+        formatted = f"*Risk Circuit Breaker*\n─────────────────────\n{message}"
+        alert_executor.submit(
+            telegram_alert_service.send_alert_sync, telegram_user["telegram_id"], formatted
+        )
+    except Exception as e:
+        logger.exception(f"Risk monitor notify failed: {e}")
+
+
+def risk_monitor_job():
+    """Per-minute scheduler entrypoint for the daily-loss circuit breaker.
+
+    Cheap short-circuit: only computes P&L when at least one strategy is
+    running. Delegates the decision + action to
+    ``services.risk_monitor_service.run_risk_check``. Wrapped so a failure
+    logs and never propagates to the APScheduler thread.
+    """
+    try:
+        from services.risk_monitor_service import load_risk_config, run_risk_check
+
+        cfg = load_risk_config()
+        if not cfg.get("enabled") or cfg.get("halted"):
+            return
+
+        # Authoritative running set by live PID/process state (NOT the possibly
+        # stale config['is_running'] flag). This same set feeds the stop path so
+        # every actually-running strategy is stopped on halt -- closing the gap
+        # where a live-by-PID / stale-False-config strategy would be latched
+        # halted but never stopped.
+        running_ids = [
+            sid
+            for sid, c in list(STRATEGY_CONFIGS.items())
+            if _is_strategy_running(sid, c)
+        ]
+        # Cheap short-circuit: avoid the P&L call when nothing is running.
+        if not running_ids:
+            return
+
+        user_id = _resolve_risk_user_id()
+        if not user_id:
+            return
+
+        run_risk_check(
+            user_id,
+            stop_fn=_risk_stop_fn,
+            flatten_fn=_risk_flatten_fn,
+            notify_fn=_risk_notify_fn,
+            running_ids=running_ids,
+        )
+    except Exception as e:
+        logger.exception(f"risk_monitor_job failed: {e}")
 
 
 def _is_strategy_running(strategy_id: str, config: dict) -> bool:
@@ -1355,6 +1532,7 @@ def market_hours_enforcer():
                     if (
                         not is_running
                         and not config.get("manually_stopped")
+                        and not _risk_breaker_halted()
                         and (not schedule_days or today_day in schedule_days)
                         and is_within_schedule_time(strategy_id)
                     ):
@@ -1768,6 +1946,23 @@ def start_strategy(strategy_id):
     is_owner, error_response = verify_strategy_ownership(strategy_id, user_id)
     if not is_owner:
         return error_response
+
+    # Risk circuit breaker: refuse to start while halted.
+    try:
+        from services.risk_monitor_service import load_risk_config
+
+        if load_risk_config().get("halted"):
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "message": "Risk circuit breaker is active - reset it on the dashboard before starting strategies",
+                    }
+                ),
+                409,
+            )
+    except Exception as e:
+        logger.exception(f"Risk breaker check failed for start {strategy_id}: {e}")
 
     # Check if scheduler is enabled - auto-enable with defaults for old strategies
     config = STRATEGY_CONFIGS.get(strategy_id, {})
@@ -2320,6 +2515,114 @@ def api_get_strategies():
         )
 
     return jsonify({"strategies": strategies})
+
+
+@python_strategy_bp.route("/api/watchlists")
+@check_session_validity
+def api_get_watchlists():
+    """API: Read-only screened per-exchange watchlists as JSON.
+
+    Reads the screener/MCX-resolver output files at strategies/watchlists/
+    <EXCHANGE>.txt for a fixed set of exchanges, returning only those whose
+    file exists. Each entry carries the parsed OpenAlgo symbols, a count, the
+    first header comment (the screener's "generated ..." note) if present, and
+    the file's modification time. Never raises: on any error returns an error
+    payload.
+    """
+    try:
+        from strategies.watchlist_loader import read_watchlists
+
+        watchlists = read_watchlists(None, ["NSE", "BSE", "MCX", "NFO", "CDS"])
+        return jsonify({"status": "success", "data": {"watchlists": watchlists}})
+    except Exception as e:
+        logger.exception(f"Failed to read watchlists: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@python_strategy_bp.route("/api/strategy-pnl")
+@check_session_validity
+def api_strategy_pnl():
+    """API: Per-strategy and portfolio P&L for the logged-in user as JSON.
+
+    Detects live vs analyzer (sandbox) mode server-side and returns realized /
+    unrealized / day P&L grouped by the ``strategy`` order tag, plus portfolio
+    totals (wins, losses, win rate, open positions).
+    """
+    user_id = session.get("user")
+    if not user_id:
+        return jsonify({"status": "error", "message": "Not authenticated"}), 401
+
+    from services.strategy_pnl_service import get_strategy_pnl
+
+    result = get_strategy_pnl(user_id)
+    status_code = 200 if result.get("status") == "success" else 500
+    return jsonify(result), status_code
+
+
+def _live_portfolio_day_pnl(user_id):
+    """Compute the account intraday P&L for the risk-status routes.
+
+    Returns 0.0 if the P&L cannot be computed (the status still renders with
+    the stored config, just without a live number).
+    """
+    from services.risk_monitor_service import compute_portfolio_day_pnl
+
+    pnl = compute_portfolio_day_pnl(user_id)
+    return pnl if pnl is not None else 0.0
+
+
+@python_strategy_bp.route("/api/risk", methods=["GET"])
+@check_session_validity
+def api_risk_get():
+    """API: Current risk circuit-breaker status (config + live P&L + breaching)."""
+    user_id = session.get("user")
+    if not user_id:
+        return jsonify({"status": "error", "message": "Not authenticated"}), 401
+
+    from services.risk_monitor_service import get_risk_status
+
+    pnl = _live_portfolio_day_pnl(user_id)
+    return jsonify({"status": "success", "data": get_risk_status(pnl)}), 200
+
+
+@python_strategy_bp.route("/api/risk", methods=["POST"])
+@check_session_validity
+def api_risk_update():
+    """API: Update risk config (enabled, daily_loss_limit, flatten_on_halt)."""
+    user_id = session.get("user")
+    if not user_id:
+        return jsonify({"status": "error", "message": "Not authenticated"}), 401
+
+    from services.risk_monitor_service import get_risk_status, update_risk_config
+
+    body = request.get_json(silent=True) or {}
+    fields = {}
+    for key in ("enabled", "daily_loss_limit", "flatten_on_halt"):
+        if key in body:
+            fields[key] = body[key]
+
+    try:
+        update_risk_config(**fields)
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    pnl = _live_portfolio_day_pnl(user_id)
+    return jsonify({"status": "success", "data": get_risk_status(pnl)}), 200
+
+
+@python_strategy_bp.route("/api/risk/reset", methods=["POST"])
+@check_session_validity
+def api_risk_reset():
+    """API: Reset (re-arm) the risk circuit breaker after a halt."""
+    user_id = session.get("user")
+    if not user_id:
+        return jsonify({"status": "error", "message": "Not authenticated"}), 401
+
+    from services.risk_monitor_service import get_risk_status, reset_halt
+
+    reset_halt()
+    pnl = _live_portfolio_day_pnl(user_id)
+    return jsonify({"status": "success", "data": get_risk_status(pnl)}), 200
 
 
 @python_strategy_bp.route("/api/events")
