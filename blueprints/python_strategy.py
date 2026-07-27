@@ -2322,6 +2322,26 @@ def api_get_strategies():
     return jsonify({"strategies": strategies})
 
 
+@python_strategy_bp.route("/api/strategy-pnl")
+@check_session_validity
+def api_strategy_pnl():
+    """API: Per-strategy and portfolio P&L for the logged-in user as JSON.
+
+    Detects live vs analyzer (sandbox) mode server-side and returns realized /
+    unrealized / day P&L grouped by the ``strategy`` order tag, plus portfolio
+    totals (wins, losses, win rate, open positions).
+    """
+    user_id = session.get("user")
+    if not user_id:
+        return jsonify({"status": "error", "message": "Not authenticated"}), 401
+
+    from services.strategy_pnl_service import get_strategy_pnl
+
+    result = get_strategy_pnl(user_id)
+    status_code = 200 if result.get("status") == "success" else 500
+    return jsonify(result), status_code
+
+
 @python_strategy_bp.route("/api/events")
 @check_session_validity
 def api_strategy_events():
