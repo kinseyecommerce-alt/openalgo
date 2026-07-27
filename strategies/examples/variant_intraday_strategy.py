@@ -65,7 +65,7 @@ IST = ZoneInfo("Asia/Kolkata")
 # Make the shared watchlist loader importable whether this file runs from
 # strategies/scripts, strategies/examples, or a deployed copy in strategies/.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from watchlist_loader import load_watchlist  # noqa: E402
+from watchlist_loader import empty_watchlist_warning, load_watchlist  # noqa: E402
 
 # ===============================================================================
 # CONFIGURATION (env vars, read once at startup)
@@ -1808,13 +1808,12 @@ class VariantIntradayBot:
             f"Variant resolved: {self.variant_key} ({self.variant['name']}) - "
             f"{self.variant['description']}"
         )
-        if EXCHANGE == "MCX" and _WATCHLIST_ENV is None:
-            log(
-                "WARNING: EXCHANGE=MCX with no WATCHLIST set - MCX symbols carry "
-                "expiries so there is NO safe default watchlist. Scanning NOTHING. "
-                "Set WATCHLIST to current-expiry MCX symbols (e.g. "
-                "CRUDEOIL<expiry>FUT) to trade."
-            )
+        # Any exchange whose watchlist resolves to nothing scans NOTHING and would
+        # otherwise idle silently. Covers MCX, NFO/BFO (expiry-bearing, need the
+        # resolvers), an empty screened file, and an empty WATCHLIST override.
+        empty_warning = empty_watchlist_warning(EXCHANGE, _WATCHLIST_ENV, WATCHLIST)
+        if empty_warning:
+            log(empty_warning)
 
         if EXIT_MODE == "TARGET":
             exit_desc = f"fixed target {TARGET_R}R (breakeven at {BREAKEVEN_R}R)"

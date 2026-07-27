@@ -50,7 +50,7 @@ IST = ZoneInfo("Asia/Kolkata")
 # Make the shared watchlist loader importable whether this file runs from
 # strategies/scripts, strategies/examples, or a deployed copy in strategies/.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from watchlist_loader import load_watchlist  # noqa: E402
+from watchlist_loader import empty_watchlist_warning, load_watchlist  # noqa: E402
 
 # ===============================================================================
 # CONFIGURATION (env vars, read once at startup)
@@ -89,7 +89,8 @@ DEFAULT_NSE_WATCHLIST = [
     "NTPC",
     "TATASTEEL",
 ]
-WATCHLIST = load_watchlist(EXCHANGE, DEFAULT_NSE_WATCHLIST, os.getenv("WATCHLIST"))
+_WATCHLIST_ENV = os.getenv("WATCHLIST")
+WATCHLIST = load_watchlist(EXCHANGE, DEFAULT_NSE_WATCHLIST, _WATCHLIST_ENV)
 MAX_SCAN_SYMBOLS = 20
 QUANTITY = int(os.getenv("QUANTITY", "1"))
 PRODUCT = os.getenv("PRODUCT", "MIS")
@@ -900,6 +901,12 @@ class FourEmaRetracementBot:
         direction = TRADE_DIRECTION if TRADE_DIRECTION in ("LONG", "SHORT", "BOTH") else "BOTH"
         if direction != TRADE_DIRECTION:
             log(f"WARNING: invalid TRADE_DIRECTION {TRADE_DIRECTION!r}, using BOTH")
+
+        # An empty watchlist means this engine scans NOTHING - say so loudly at
+        # startup instead of idling silently (MCX/NFO need their resolver run).
+        empty_warning = empty_watchlist_warning(EXCHANGE, _WATCHLIST_ENV, WATCHLIST)
+        if empty_warning:
+            log(empty_warning)
 
         if EXIT_MODE == "TARGET":
             exit_desc = f"fixed target {TARGET_R}R (breakeven at {BREAKEVEN_R}R)"
