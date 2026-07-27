@@ -2322,6 +2322,28 @@ def api_get_strategies():
     return jsonify({"strategies": strategies})
 
 
+@python_strategy_bp.route("/api/watchlists")
+@check_session_validity
+def api_get_watchlists():
+    """API: Read-only screened per-exchange watchlists as JSON.
+
+    Reads the screener/MCX-resolver output files at strategies/watchlists/
+    <EXCHANGE>.txt for a fixed set of exchanges, returning only those whose
+    file exists. Each entry carries the parsed OpenAlgo symbols, a count, the
+    first header comment (the screener's "generated ..." note) if present, and
+    the file's modification time. Never raises: on any error returns an error
+    payload.
+    """
+    try:
+        from strategies.watchlist_loader import read_watchlists
+
+        watchlists = read_watchlists(None, ["NSE", "BSE", "MCX", "NFO", "CDS"])
+        return jsonify({"status": "success", "data": {"watchlists": watchlists}})
+    except Exception as e:
+        logger.exception(f"Failed to read watchlists: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @python_strategy_bp.route("/api/strategy-pnl")
 @check_session_validity
 def api_strategy_pnl():

@@ -30,6 +30,8 @@ liquidity + volatility screener).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 
 # Directory (relative to this module, i.e. strategies/) that holds the
@@ -94,6 +96,72 @@ def watchlist_file_path(exchange: str, watchlist_dir: str | Path | None = None) 
     if not safe:
         safe = "UNKNOWN"
     return base / f"{safe}.txt"
+
+
+def read_watchlists(
+    watchlist_dir: str | Path | None,
+    exchanges: Iterable[str],
+) -> list[dict]:
+    """Read the screened watchlist files for a set of exchanges (pure, no Flask).
+
+    For each exchange whose ``<EXCHANGE>.txt`` file exists (located exactly as
+    :func:`watchlist_file_path` does, so path traversal is sanitized away),
+    parse its symbols via :func:`parse_symbol_list`, capture the first
+    ``#``-comment line as a human "generated" note (leading ``#`` and
+    whitespace stripped), and record the file's modification time as an
+    ISO-8601 string. Exchanges with no file -- or an unreadable/empty-path
+    file -- are omitted. This function never raises; an unreadable file is
+    simply skipped.
+
+    Args:
+        watchlist_dir: Directory holding the per-exchange files; ``None`` uses
+            the default ``watchlists`` directory next to this module.
+        exchanges: Exchange codes to check, in the order to return them
+            (e.g. ``["NSE", "BSE", "MCX", "NFO", "CDS"]``).
+
+    Returns:
+        A list of dicts (existing files only, in ``exchanges`` order)::
+
+            {"exchange": "NSE", "symbols": [...], "count": N,
+             "generated": "<first header comment or None>",
+             "updated_at": "<file mtime ISO-8601 or None>"}
+    """
+    out: list[dict] = []
+    for exchange in exchanges:
+        path = watchlist_file_path(exchange, watchlist_dir)
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            # Unreadable file -> skip it, never raise.
+            continue
+
+        symbols = parse_symbol_list(text)
+
+        generated: str | None = None
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                generated = stripped.lstrip("#").strip() or None
+                break
+
+        updated_at: str | None = None
+        try:
+            updated_at = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+        except OSError:
+            updated_at = None
+
+        out.append(
+            {
+                "exchange": path.stem,
+                "symbols": symbols,
+                "count": len(symbols),
+                "generated": generated,
+                "updated_at": updated_at,
+            }
+        )
+    return out
 
 
 def load_watchlist(
