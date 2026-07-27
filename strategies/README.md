@@ -328,6 +328,41 @@ Run a scanning strategy instance with `EXCHANGE=NFO` and leave `WATCHLIST` unset
 it will read the resolved `NFO.txt`. Same daily-pre-session scheduling
 recommendation as MCX so the watchlist always holds the live near-month set.
 
+## NFO index-options resolver (CE/PE strikes)
+
+`strategies/nfo_options_resolver.py` resolves a ring of strikes around the money
+— ATM plus N ITM and N OTM — for CE and/or PE on the chosen weekly or monthly
+expiry, and writes the tradable option symbols to `strategies/watchlists/NFO.txt`.
+
+Symbols are resolved **authoritatively** through the SDK's `optionsymbol`, which
+computes ATM from live spot server-side and returns the exact tradable symbol and
+lot size. Nothing is string-built, so the per-index strike interval and the
+master contract's decimal-strike rules never have to be guessed.
+
+Offsets are expressed relative to the money (`ATM`, `ITM1..N`, `OTM1..N`), which
+is direction-correct for both types automatically — for a CE, OTM is a *higher*
+strike; for a PE, OTM is a *lower* one. So `--strikes N` means "N either side of
+ATM" whichever type is being resolved.
+
+```bash
+uv run python strategies/nfo_options_resolver.py --user <id> \
+    [--indices NIFTY,BANKNIFTY] [--strikes 2] [--option-types CE,PE] \
+    [--expiry-kind weekly|monthly] [--min-days-to-expiry 0] \
+    [--merge | --replace] [--dry-run] [--allow-empty] \
+    [--watchlist-dir strategies/watchlists] [--sleep 0.2]
+```
+
+`--strikes 2 --option-types CE,PE` resolves `ITM2 ITM1 ATM OTM1 OTM2` × `{CE,PE}`
+= 10 symbols per index. `--expiry-kind monthly` restricts selection to the last
+expiry of a calendar month (the monthly contract); `weekly` takes the nearest.
+
+**`NFO.txt` is shared with the futures resolver** — one watchlist file per
+exchange. Writing options would otherwise replace the index futures, so the run
+**refuses** to clobber a file containing FUT symbols unless you pass `--merge`
+(keep both) or `--replace` (overwrite deliberately). The scanning strategies cap
+at `MAX_SCAN_SYMBOLS` (20), and the resolver warns when the resulting list would
+exceed it rather than letting the tail be silently dropped.
+
 ## Safety Features
 
 - Process isolation prevents strategy crashes from affecting the system
