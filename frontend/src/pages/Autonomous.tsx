@@ -18,7 +18,12 @@ import {
   Square,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { autonomousApi, type StrategyPnl, type StrategyPnlData } from '@/api/autonomous'
+import {
+  autonomousApi,
+  type ScreenedWatchlist,
+  type StrategyPnl,
+  type StrategyPnlData,
+} from '@/api/autonomous'
 import { pythonStrategyApi } from '@/api/python-strategy'
 import { tradingApi } from '@/api/trading'
 import { useSocketContext } from '@/components/socket/SocketProvider'
@@ -40,10 +45,13 @@ import { makeFormatCurrency } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
 import { useThemeStore } from '@/stores/themeStore'
 import type { PythonStrategy } from '@/types/python-strategy'
-import type { Position } from '@/types/trading'
+import type { MarginData, Position } from '@/types/trading'
 import { showToast } from '@/utils/toast'
 
 const DEFAULT_LAGGARD_THRESHOLD = -500
+// Portfolio circuit breaker default: halt everything if the day is down more
+// than ₹5,000. Dashboard-side only (see the honesty note in the UI).
+const DEFAULT_LOSS_LIMIT = -5000
 // Sandbox trades against a fixed ₹1 Crore of simulation capital (see CLAUDE.md /
 // docs). Only used to derive a day-P&L percentage in analyzer mode; never shown
 // for live mode where the deployed capital is unknown to this view.
@@ -61,6 +69,22 @@ interface FeedEntry {
 function formatSigned(value: number): string {
   const sign = value < 0 ? '-' : '+'
   return sign + Math.abs(Math.round(value)).toLocaleString('en-IN')
+}
+
+/**
+ * Heuristic NSE/MCX open/closed from the current IST wall-clock (epoch + 5.5h,
+ * read via getUTC*, mirroring the chart's IST tick formatter). This is a rough
+ * client-side label, NOT an authoritative exchange session/holiday feed — it
+ * ignores holidays and special sessions.
+ */
+function computeMarketStatus(): { nse: boolean; mcx: boolean } {
+  const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000)
+  const weekday = ist.getUTCDay() >= 1 && ist.getUTCDay() <= 5
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes()
+  return {
+    nse: weekday && mins >= 555 && mins <= 930, // 09:15–15:30 IST
+    mcx: weekday && mins >= 540 && mins <= 1410, // 09:00–23:30 IST
+  }
 }
 
 /** A strategy is "on" when it is running or armed for its schedule. */
@@ -94,7 +118,20 @@ export default function Autonomous() {
   const [autoPause, setAutoPause] = useState(false)
   const [threshold, setThreshold] = useState<number>(DEFAULT_LAGGARD_THRESHOLD)
   // Inline confirm target: which mass action is awaiting confirmation.
-  const [confirming, setConfirming] = useState<'engine-off' | 'flatten' | null>(null)
+  const [confirming, setConfirming] = useState<'engine-off' | 'flatten' | 'halt-now' | null>(null)
+
+  // Portfolio daily loss-limit circuit breaker (dashboard-side safeguard).
+  const [autoHalt, setAutoHalt] = useState(false)
+  const [lossLimit, setLossLimit] = useState<number>(DEFAULT_LOSS_LIMIT)
+  const [halted, setHalted] = useState(false)
+  // Single-fire guard: stays true while breached so the auto-halt runs at most
+  // once per breach; re-arms only when day P&L recovers above the limit.
+  const haltFiredRef = useRef(false)
+
+  // Session health: funds probe piggybacks on the existing refetch cadence.
+  const [funds, setFunds] = useState<MarginData | null>(null)
+  const [fundsError, setFundsError] = useState(false)
+  const [watchlists, setWatchlists] = useState<ScreenedWatchlist[]>([])
 
   // Chart refs (mirrors PnLTracker.tsx)
   const chartContainerRef = useRef<HTMLDivElement>(null)
@@ -134,6 +171,23 @@ export default function Autonomous() {
     }
   }, [apiKey])
 
+  // Session liveness probe — reuses the existing /funds call (no new endpoint).
+  // Success ⇒ broker session is live; error ⇒ prompt a re-login.
+  const loadFunds = useCallback(async () => {
+    if (!apiKey) return
+    try {
+      const res = await tradingApi.getFunds(apiKey)
+      if (res.status === 'success' && res.data) {
+        setFunds(res.data)
+        setFundsError(false)
+      } else {
+        setFundsError(true)
+      }
+    } catch {
+      setFundsError(true)
+    }
+  }, [apiKey])
+
   const loadCurve = useCallback(async () => {
     try {
       const res = await autonomousApi.getPnlSeries()
@@ -156,18 +210,36 @@ export default function Autonomous() {
     }
   }, [])
 
+  // Screened watchlists refresh once a day (pre-market), so they load on mount
+  // and on manual refresh rather than in the hot per-event refetch path.
+  const loadWatchlists = useCallback(async () => {
+    try {
+      const res = await autonomousApi.getWatchlists()
+      setWatchlists(res.status === 'success' ? (res.data?.watchlists ?? []) : [])
+    } catch {
+      setWatchlists([])
+    }
+  }, [])
+
   const refetch = useCallback(() => {
     loadStrategies()
     loadPnl()
     loadPositions()
     loadCurve()
-  }, [loadStrategies, loadPnl, loadPositions, loadCurve])
+    loadFunds()
+  }, [loadStrategies, loadPnl, loadPositions, loadCurve, loadFunds])
 
   // Initial load
   useEffect(() => {
     setLoading(true)
-    Promise.all([loadStrategies(), loadPnl(), loadPositions()]).finally(() => setLoading(false))
-  }, [loadStrategies, loadPnl, loadPositions])
+    Promise.all([
+      loadStrategies(),
+      loadPnl(),
+      loadPositions(),
+      loadFunds(),
+      loadWatchlists(),
+    ]).finally(() => setLoading(false))
+  }, [loadStrategies, loadPnl, loadPositions, loadFunds, loadWatchlists])
 
   // ---- lightweight-charts init (mirror of PnLTracker) ----
   const initChart = useCallback(() => {
@@ -334,6 +406,16 @@ export default function Autonomous() {
     }
   }, [])
 
+  // Shared mass-stop: stop every running/armed strategy and park the engine.
+  // The master engine "off", the circuit breaker, and "Halt now" all route
+  // through this one action (positions are left untouched — flatten is separate).
+  const haltAllStrategies = useCallback(async (): Promise<number> => {
+    const on = strategies.filter(isStrategyOn)
+    await Promise.allSettled(on.map((s) => stopStrategy(s)))
+    setEngineOff(true)
+    return on.length
+  }, [strategies, stopStrategy])
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally keyed on pnl+autoPause; evaluating laggards each P&L tick
   useEffect(() => {
     if (!autoPause || !pnl) return
@@ -348,6 +430,35 @@ export default function Autonomous() {
       loadStrategies()
     })()
   }, [pnl, autoPause])
+
+  // ---- portfolio circuit breaker: auto-halt when day P&L breaches the limit ----
+  // Fires the SAME mass-stop as the master engine "off", at most once per breach.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on pnl/autoHalt/lossLimit; haltAllStrategies/loadStrategies are stable refs
+  useEffect(() => {
+    if (!autoHalt) {
+      haltFiredRef.current = false
+      return
+    }
+    if (!pnl) return
+    const dp = pnl.totals.day_pnl
+    if (dp < lossLimit) {
+      if (haltFiredRef.current) return
+      haltFiredRef.current = true
+      ;(async () => {
+        await haltAllStrategies()
+        setHalted(true)
+        showToast.error(
+          `Daily loss limit hit (day P&L ${formatSigned(dp)}) — all strategies halted`,
+          'pythonStrategy'
+        )
+        loadStrategies()
+      })()
+    } else {
+      // Recovered above the limit — clear the banner and re-arm for a new breach.
+      haltFiredRef.current = false
+      setHalted(false)
+    }
+  }, [pnl, autoHalt, lossLimit])
 
   // ---- row toggle ----
   const handleToggle = async (s: PythonStrategy) => {
@@ -385,14 +496,15 @@ export default function Autonomous() {
     setConfirming(null)
     try {
       if (goingOff) {
-        const on = strategies.filter(isStrategyOn)
-        await Promise.allSettled(on.map((s) => stopStrategy(s)))
-        setEngineOff(true)
-        showToast.success(`Engine paused — halted ${on.length} strategy(ies)`, 'pythonStrategy')
+        const count = await haltAllStrategies()
+        showToast.success(`Engine paused — halted ${count} strategy(ies)`, 'pythonStrategy')
       } else {
         const off = strategies.filter((s) => !isStrategyOn(s))
         await Promise.allSettled(off.map((s) => startStrategy(s)))
         setEngineOff(false)
+        // Resuming clears the circuit-breaker latch and re-arms the guard.
+        setHalted(false)
+        haltFiredRef.current = false
         showToast.success(`Engine resumed — starting ${off.length} strategy(ies)`, 'pythonStrategy')
       }
     } finally {
@@ -444,6 +556,22 @@ export default function Autonomous() {
     }
   }
 
+  // ---- halt now: mass-stop strategies without flattening (companion to auto-halt) ----
+  const handleHaltNow = async () => {
+    setBusy(true)
+    setConfirming(null)
+    try {
+      const count = await haltAllStrategies()
+      showToast.success(
+        `Halted ${count} strategy(ies) — open positions untouched`,
+        'pythonStrategy'
+      )
+    } finally {
+      setBusy(false)
+      loadStrategies()
+    }
+  }
+
   // ---- derived ----
   const totals = pnl?.totals
   const onCount = strategies.filter(isStrategyOn).length
@@ -461,6 +589,9 @@ export default function Autonomous() {
 
   const pnlClass = (v: number) =>
     v > 0 ? 'text-green-500' : v < 0 ? 'text-red-500' : 'text-muted-foreground'
+
+  // Heuristic market status, recomputed each render (label only, not authoritative).
+  const market = computeMarketStatus()
 
   return (
     <div className="container mx-auto py-6 space-y-6">
@@ -523,6 +654,69 @@ export default function Autonomous() {
         </div>
       </div>
 
+      {/* ---- Session / broker health strip (derived from data already loaded) ---- */}
+      <Card>
+        <CardContent className="flex flex-wrap items-center gap-x-6 gap-y-2 py-3 text-sm">
+          {/* Broker mode */}
+          <div className="flex items-center gap-2">
+            <span className="text-muted-foreground">Broker</span>
+            <Badge variant={pnl?.mode === 'live' ? 'default' : 'secondary'}>
+              {pnl?.mode === 'live' ? 'Live' : 'Analyzer (sandbox)'}
+            </Badge>
+          </div>
+
+          {/* Session liveness (from the /funds probe) */}
+          <div className="flex items-center gap-2">
+            {fundsError ? (
+              <>
+                <span className="h-2 w-2 rounded-full bg-amber-500" />
+                <span className="text-amber-600 dark:text-amber-400">Session check failed</span>
+                <a href="/broker" className="text-muted-foreground underline hover:text-foreground">
+                  Re-login
+                </a>
+              </>
+            ) : funds ? (
+              <>
+                <span className="h-2 w-2 rounded-full bg-green-500" />
+                <span>Session active</span>
+                <span className="font-mono text-muted-foreground">
+                  {formatCurrency(funds.availablecash)}
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="h-2 w-2 rounded-full bg-muted-foreground/40" />
+                <span className="text-muted-foreground">Checking session…</span>
+              </>
+            )}
+          </div>
+
+          {/* Market status (client-side IST heuristic) */}
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-muted-foreground">Market</span>
+            <span className="flex items-center gap-1.5">
+              <span
+                className={`h-2 w-2 rounded-full ${market.nse ? 'bg-green-500' : 'bg-muted-foreground/40'}`}
+              />
+              NSE {market.nse ? 'open' : 'closed'}
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span
+                className={`h-2 w-2 rounded-full ${market.mcx ? 'bg-green-500' : 'bg-muted-foreground/40'}`}
+              />
+              MCX {market.mcx ? 'open' : 'closed'}
+            </span>
+            <span
+              className="flex items-center gap-1 text-xs text-muted-foreground"
+              title="Derived from your local clock in IST; ignores holidays and special sessions. Not an authoritative exchange feed."
+            >
+              <Info className="h-3 w-3" />
+              IST heuristic
+            </span>
+          </div>
+        </CardContent>
+      </Card>
+
       {/* Inline confirms */}
       {confirming === 'engine-off' && (
         <Card className="border-yellow-500/40 bg-yellow-500/10">
@@ -558,6 +752,37 @@ export default function Autonomous() {
                 Flatten &amp; halt
               </Button>
             </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {confirming === 'halt-now' && (
+        <Card className="border-red-500/40 bg-red-500/10">
+          <CardContent className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-2 text-sm">
+              <AlertTriangle className="h-4 w-4 text-red-500" />
+              Halt now? This stops all {onCount} running strategy(ies). Open positions stay as-is
+              (use Flatten &amp; halt to also square off).
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={() => setConfirming(null)}>
+                Cancel
+              </Button>
+              <Button variant="destructive" size="sm" onClick={handleHaltNow} disabled={busy}>
+                Halt now
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Circuit-breaker banner: daily loss limit hit */}
+      {halted && (
+        <Card className="border-red-500/60 bg-red-500/15">
+          <CardContent className="flex items-center gap-2 py-3 text-sm font-semibold text-red-700 dark:text-red-400">
+            <AlertTriangle className="h-4 w-4" />
+            Daily loss limit hit (day P&amp;L {formatSigned(dayPnl)} below {formatSigned(lossLimit)}
+            ) — all strategies halted.
           </CardContent>
         </Card>
       )}
@@ -669,6 +894,43 @@ export default function Autonomous() {
                   Pause laggards ({laggards.length})
                 </Button>
               </div>
+            </div>
+
+            {/* Portfolio circuit breaker — dashboard-side safeguard */}
+            <div className="flex flex-col gap-1 border-t pt-3">
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Switch
+                    checked={autoHalt}
+                    onCheckedChange={setAutoHalt}
+                    aria-label="Auto-halt on daily loss limit"
+                  />
+                  Halt all if day P&amp;L below
+                </label>
+                <Input
+                  type="number"
+                  value={lossLimit}
+                  onChange={(e) => setLossLimit(Number(e.target.value))}
+                  className="h-8 w-28 font-mono"
+                  aria-label="Daily loss limit"
+                />
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => setConfirming('halt-now')}
+                  disabled={busy || onCount === 0}
+                >
+                  <Power className="h-4 w-4 mr-2" />
+                  Halt now
+                </Button>
+              </div>
+              <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Info className="h-3 w-3 shrink-0" />
+                <span title="This circuit breaker runs only in this browser tab while the dashboard is open. If the tab is closed it will not fire. It is a dashboard-side safeguard, not a server-side guarantee.">
+                  Acts while this dashboard is open — a browser-side safeguard, not a server-side
+                  guarantee.
+                </span>
+              </p>
             </div>
           </CardHeader>
           <CardContent>
@@ -938,12 +1200,60 @@ export default function Autonomous() {
             <CardTitle className="text-base">Screened watchlist</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="flex flex-col items-center gap-2 py-6 text-center">
-              <Circle className="h-6 w-6 text-muted-foreground" />
-              <p className="text-sm text-muted-foreground">
-                Screened watchlist appears here once the pre-market screener has run.
-              </p>
-            </div>
+            {watchlists.length === 0 ? (
+              <div className="flex flex-col items-center gap-2 py-6 text-center">
+                <Circle className="h-6 w-6 text-muted-foreground" />
+                <p className="text-sm text-muted-foreground">
+                  Screened watchlist appears here once the pre-market screener has run.
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-4">
+                {watchlists.map((wl) => (
+                  <div key={wl.exchange} className="flex flex-col gap-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Badge variant="outline" className="uppercase">
+                          {wl.exchange}
+                        </Badge>
+                        <span className="text-xs text-muted-foreground">
+                          {wl.count} {wl.count === 1 ? 'symbol' : 'symbols'}
+                        </span>
+                      </div>
+                      {wl.updated_at ? (
+                        <span
+                          className="text-xs text-muted-foreground"
+                          title={wl.generated ?? undefined}
+                        >
+                          {new Date(wl.updated_at).toLocaleString('en-IN', {
+                            day: '2-digit',
+                            month: 'short',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </span>
+                      ) : null}
+                    </div>
+                    {wl.symbols.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">
+                        No symbols passed the screen for this exchange.
+                      </p>
+                    ) : (
+                      <div className="flex flex-wrap gap-1.5">
+                        {wl.symbols.map((sym) => (
+                          <span
+                            key={sym}
+                            className="rounded-md border bg-muted/40 px-2 py-0.5 font-mono text-xs"
+                          >
+                            {sym}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>

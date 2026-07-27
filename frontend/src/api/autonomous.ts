@@ -48,6 +48,20 @@ export interface PnlTrackerData {
   drawdown_series: PnlSeriesPoint[]
 }
 
+// Screened watchlist written by the pre-market screener / MCX resolver to
+// strategies/watchlists/<EXCHANGE>.txt and read back for display.
+export interface ScreenedWatchlist {
+  exchange: string
+  symbols: string[]
+  count: number
+  generated: string | null
+  updated_at: string | null
+}
+
+export interface WatchlistsData {
+  watchlists: ScreenedWatchlist[]
+}
+
 export const autonomousApi = {
   /**
    * Per-strategy and portfolio P&L for the logged-in user.
@@ -64,6 +78,16 @@ export const autonomousApi = {
    */
   getPnlSeries: async (): Promise<ApiResponse<PnlTrackerData>> => {
     const response = await webClient.post<ApiResponse<PnlTrackerData>>('/pnltracker/api/pnl', {})
+    return response.data
+  },
+
+  /**
+   * Screened watchlists (NSE / BSE / MCX / ...) the pre-market screener and
+   * MCX resolver wrote to disk. Session route (webClient). Only exchanges
+   * whose file exists are returned.
+   */
+  getWatchlists: async (): Promise<ApiResponse<WatchlistsData>> => {
+    const response = await webClient.get<ApiResponse<WatchlistsData>>('/python/api/watchlists')
     return response.data
   },
 }
