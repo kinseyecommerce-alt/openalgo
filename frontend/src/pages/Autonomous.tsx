@@ -15,11 +15,14 @@ import {
   PauseCircle,
   Power,
   RefreshCw,
+  ShieldAlert,
   Square,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   autonomousApi,
+  type RiskStatus,
+  type RiskUpdate,
   type ScreenedWatchlist,
   type StrategyPnl,
   type StrategyPnlData,
@@ -120,13 +123,21 @@ export default function Autonomous() {
   // Inline confirm target: which mass action is awaiting confirmation.
   const [confirming, setConfirming] = useState<'engine-off' | 'flatten' | 'halt-now' | null>(null)
 
-  // Portfolio daily loss-limit circuit breaker (dashboard-side safeguard).
+  // BROWSER-SIDE portfolio daily loss-limit circuit breaker (this-tab-only
+  // secondary safeguard; the authoritative one is the server-side breaker below).
   const [autoHalt, setAutoHalt] = useState(false)
   const [lossLimit, setLossLimit] = useState<number>(DEFAULT_LOSS_LIMIT)
   const [halted, setHalted] = useState(false)
   // Single-fire guard: stays true while breached so the auto-halt runs at most
   // once per breach; re-arms only when day P&L recovers above the limit.
   const haltFiredRef = useRef(false)
+
+  // SERVER-SIDE (authoritative, always-on) circuit breaker. Runs on the server
+  // every minute — halts even when this dashboard is closed. null = not loaded.
+  const [risk, setRisk] = useState<RiskStatus | null>(null)
+  const [riskBusy, setRiskBusy] = useState(false)
+  // Editable draft for the loss-limit input, synced from server state below.
+  const [limitDraft, setLimitDraft] = useState('')
 
   // Session health: funds probe piggybacks on the existing refetch cadence.
   const [funds, setFunds] = useState<MarginData | null>(null)
@@ -221,13 +232,30 @@ export default function Autonomous() {
     }
   }, [])
 
+  // Server-side circuit-breaker status. Keeps the halted banner live on the
+  // shared refetch cadence. On failure, risk stays null → controls show as
+  // "unavailable" rather than fabricating an all-clear state.
+  const loadRisk = useCallback(async () => {
+    try {
+      const res = await autonomousApi.getRisk()
+      if (res.status === 'success' && res.data) {
+        setRisk(res.data)
+      } else {
+        setRisk(null)
+      }
+    } catch {
+      setRisk(null)
+    }
+  }, [])
+
   const refetch = useCallback(() => {
     loadStrategies()
     loadPnl()
     loadPositions()
     loadCurve()
     loadFunds()
-  }, [loadStrategies, loadPnl, loadPositions, loadCurve, loadFunds])
+    loadRisk()
+  }, [loadStrategies, loadPnl, loadPositions, loadCurve, loadFunds, loadRisk])
 
   // Initial load
   useEffect(() => {
@@ -238,8 +266,51 @@ export default function Autonomous() {
       loadPositions(),
       loadFunds(),
       loadWatchlists(),
+      loadRisk(),
     ]).finally(() => setLoading(false))
-  }, [loadStrategies, loadPnl, loadPositions, loadFunds, loadWatchlists])
+  }, [loadStrategies, loadPnl, loadPositions, loadFunds, loadWatchlists, loadRisk])
+
+  // Keep the editable loss-limit input synced with the server's value.
+  useEffect(() => {
+    if (risk) setLimitDraft(String(risk.daily_loss_limit))
+  }, [risk?.daily_loss_limit, risk])
+
+  // Push a server-side breaker config change, then reflect the returned state.
+  const applyRisk = useCallback(async (body: RiskUpdate, successMsg: string) => {
+    setRiskBusy(true)
+    try {
+      const res = await autonomousApi.updateRisk(body)
+      if (res.status === 'success' && res.data) {
+        setRisk(res.data)
+        showToast.success(successMsg, 'pythonStrategy')
+      } else {
+        showToast.error(res.message || 'Failed to update circuit breaker', 'pythonStrategy')
+      }
+    } catch {
+      showToast.error('Failed to update circuit breaker', 'pythonStrategy')
+    } finally {
+      setRiskBusy(false)
+    }
+  }, [])
+
+  // Clear a tripped server-side breaker so strategies can start again.
+  const handleResetBreaker = useCallback(async () => {
+    setRiskBusy(true)
+    try {
+      const res = await autonomousApi.resetRisk()
+      if (res.status === 'success' && res.data) {
+        setRisk(res.data)
+        showToast.success('Circuit breaker reset — starts re-enabled', 'pythonStrategy')
+      } else {
+        showToast.error(res.message || 'Failed to reset breaker', 'pythonStrategy')
+      }
+    } catch {
+      showToast.error('Failed to reset breaker', 'pythonStrategy')
+    } finally {
+      setRiskBusy(false)
+      refetch()
+    }
+  }, [refetch])
 
   // ---- lightweight-charts init (mirror of PnLTracker) ----
   const initChart = useCallback(() => {
@@ -369,6 +440,20 @@ export default function Autonomous() {
     }
   }, [socket])
 
+  // ---- server-side breaker trip: refresh status immediately on the socket ----
+  useEffect(() => {
+    if (!socket) return
+    const onRiskHalt = () => {
+      loadRisk()
+      loadStrategies()
+      showToast.error('Server circuit breaker tripped — all strategies halted', 'pythonStrategy')
+    }
+    socket.on('risk_halt', onRiskHalt)
+    return () => {
+      socket.off('risk_halt', onRiskHalt)
+    }
+  }, [socket, loadRisk, loadStrategies])
+
   // ---- per-strategy P&L join: match by strategy name, fall back to id ----
   const pnlFor = useCallback(
     (s: PythonStrategy): StrategyPnl | undefined => {
@@ -460,9 +545,17 @@ export default function Autonomous() {
     }
   }, [pnl, autoHalt, lossLimit])
 
+  // Server-side breaker latch: while tripped, all new starts are blocked
+  // (the backend also returns 409; this pre-check surfaces it before the call).
+  const serverHalted = risk?.halted ?? false
+
   // ---- row toggle ----
   const handleToggle = async (s: PythonStrategy) => {
     const turningOn = !isStrategyOn(s)
+    if (turningOn && serverHalted) {
+      showToast.error('Reset the circuit breaker first', 'pythonStrategy')
+      return
+    }
     setRowBusy(s.id)
     // Optimistic
     setStrategies((prev) =>
@@ -481,8 +574,14 @@ export default function Autonomous() {
         showToast.error(res.message || 'Action failed', 'pythonStrategy')
       }
     } catch (error: unknown) {
-      const axiosError = error as { response?: { data?: { message?: string } } }
-      showToast.error(axiosError.response?.data?.message || 'Action failed', 'pythonStrategy')
+      const axiosError = error as { response?: { status?: number; data?: { message?: string } } }
+      if (axiosError.response?.status === 409) {
+        // Backend refused the start because the server breaker is tripped.
+        showToast.error('Reset the circuit breaker first', 'pythonStrategy')
+        loadRisk()
+      } else {
+        showToast.error(axiosError.response?.data?.message || 'Action failed', 'pythonStrategy')
+      }
     } finally {
       setRowBusy(null)
       loadStrategies()
@@ -517,6 +616,9 @@ export default function Autonomous() {
     if (!engineOff) {
       // Turning OFF is destructive — confirm inline.
       setConfirming('engine-off')
+    } else if (serverHalted) {
+      // Resuming is a mass-start; blocked while the server breaker is tripped.
+      showToast.error('Reset the circuit breaker first', 'pythonStrategy')
     } else {
       applyEngineToggle()
     }
@@ -625,6 +727,11 @@ export default function Autonomous() {
             className={`flex items-center gap-2 rounded-full border px-3 py-1.5 ${
               engineOff ? 'border-border' : 'border-green-500/40 bg-green-500/10'
             }`}
+            title={
+              engineOff && serverHalted
+                ? 'Starts are blocked until the circuit breaker is reset'
+                : undefined
+            }
           >
             <Power
               className={`h-4 w-4 ${engineOff ? 'text-muted-foreground' : 'text-green-500'}`}
@@ -636,7 +743,7 @@ export default function Autonomous() {
             </span>
             <Switch
               checked={!engineOff}
-              disabled={busy}
+              disabled={busy || (engineOff && serverHalted)}
               onCheckedChange={handleEngineClick}
               aria-label="Master autonomous engine"
             />
@@ -776,13 +883,48 @@ export default function Autonomous() {
         </Card>
       )}
 
-      {/* Circuit-breaker banner: daily loss limit hit */}
+      {/* SERVER-SIDE circuit-breaker banner (authoritative): tripped on the server */}
+      {risk?.halted && (
+        <Card className="border-red-500/60 bg-red-500/15">
+          <CardContent className="flex flex-col gap-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-2 text-sm font-semibold text-red-700 dark:text-red-400">
+              <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                Circuit breaker tripped
+                {risk.halted_at
+                  ? ` ${new Date(risk.halted_at).toLocaleString('en-IN', {
+                      day: '2-digit',
+                      month: 'short',
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    })}`
+                  : ''}{' '}
+                — day P&amp;L {risk.halted_pnl != null ? formatSigned(risk.halted_pnl) : '—'} hit
+                the {formatSigned(-Math.abs(risk.daily_loss_limit))} limit. All strategies halted;
+                new starts are blocked.
+              </span>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleResetBreaker}
+              disabled={riskBusy}
+              className="shrink-0"
+            >
+              <RefreshCw className={`h-4 w-4 mr-2 ${riskBusy ? 'animate-spin' : ''}`} />
+              Reset breaker
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Local (this-tab-only) circuit-breaker banner: daily loss limit hit */}
       {halted && (
         <Card className="border-red-500/60 bg-red-500/15">
           <CardContent className="flex items-center gap-2 py-3 text-sm font-semibold text-red-700 dark:text-red-400">
             <AlertTriangle className="h-4 w-4" />
-            Daily loss limit hit (day P&amp;L {formatSigned(dayPnl)} below {formatSigned(lossLimit)}
-            ) — all strategies halted.
+            Local safeguard (this tab only): day P&amp;L {formatSigned(dayPnl)} below{' '}
+            {formatSigned(lossLimit)} — all strategies halted.
           </CardContent>
         </Card>
       )}
@@ -896,41 +1038,150 @@ export default function Autonomous() {
               </div>
             </div>
 
-            {/* Portfolio circuit breaker — dashboard-side safeguard */}
-            <div className="flex flex-col gap-1 border-t pt-3">
-              <div className="flex flex-wrap items-center gap-3">
-                <label className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Switch
-                    checked={autoHalt}
-                    onCheckedChange={setAutoHalt}
-                    aria-label="Auto-halt on daily loss limit"
-                  />
-                  Halt all if day P&amp;L below
-                </label>
-                <Input
-                  type="number"
-                  value={lossLimit}
-                  onChange={(e) => setLossLimit(Number(e.target.value))}
-                  className="h-8 w-28 font-mono"
-                  aria-label="Daily loss limit"
-                />
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  onClick={() => setConfirming('halt-now')}
-                  disabled={busy || onCount === 0}
-                >
-                  <Power className="h-4 w-4 mr-2" />
-                  Halt now
-                </Button>
+            {/* ---- Circuit breaker ---- */}
+            <div className="flex flex-col gap-3 border-t pt-3">
+              {/* SERVER-SIDE (authoritative, always-on) — visually primary */}
+              <div className="rounded-lg border border-primary/40 bg-primary/5 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <ShieldAlert className="h-4 w-4 text-primary" />
+                    <span className="text-sm font-semibold">Server-side circuit breaker</span>
+                    <Badge variant="outline" className="text-[10px] uppercase">
+                      Always on
+                    </Badge>
+                  </div>
+                  {risk ? (
+                    <Switch
+                      checked={risk.enabled}
+                      disabled={riskBusy}
+                      onCheckedChange={(v) =>
+                        applyRisk(
+                          { enabled: v },
+                          v ? 'Server breaker enabled' : 'Server breaker disabled'
+                        )
+                      }
+                      aria-label="Server-side circuit breaker enabled"
+                    />
+                  ) : (
+                    <Badge variant="secondary">Unavailable</Badge>
+                  )}
+                </div>
+
+                {risk ? (
+                  <div className="mt-3 flex flex-col gap-2">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                        Daily loss limit &#8377;
+                        <Input
+                          type="number"
+                          min={0}
+                          value={limitDraft}
+                          onChange={(e) => setLimitDraft(e.target.value)}
+                          onBlur={() => {
+                            const n = Math.abs(Number(limitDraft))
+                            if (Number.isFinite(n) && n > 0 && n !== risk.daily_loss_limit) {
+                              applyRisk(
+                                { daily_loss_limit: n },
+                                `Loss limit set to ${n.toLocaleString('en-IN')}`
+                              )
+                            } else {
+                              setLimitDraft(String(risk.daily_loss_limit))
+                            }
+                          }}
+                          disabled={riskBusy || !risk.enabled}
+                          className="h-8 w-28 font-mono"
+                          aria-label="Server daily loss limit"
+                        />
+                      </label>
+                      <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Switch
+                          checked={risk.flatten_on_halt}
+                          disabled={riskBusy}
+                          onCheckedChange={(v) =>
+                            applyRisk(
+                              { flatten_on_halt: v },
+                              v ? 'Will square off on halt' : 'Will not square off on halt'
+                            )
+                          }
+                          aria-label="Flatten open positions on halt"
+                        />
+                        Flatten on halt
+                      </label>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+                      <span className="text-muted-foreground">
+                        Day P&amp;L{' '}
+                        <span className={`font-mono font-semibold ${pnlClass(risk.day_pnl)}`}>
+                          {formatSigned(risk.day_pnl)}
+                        </span>{' '}
+                        vs limit{' '}
+                        <span className="font-mono">
+                          {formatSigned(-Math.abs(risk.daily_loss_limit))}
+                        </span>
+                      </span>
+                      {risk.breaching && !risk.halted && (
+                        <Badge variant="destructive" className="text-[10px] uppercase">
+                          Breaching
+                        </Badge>
+                      )}
+                    </div>
+                    <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
+                      <Info className="mt-0.5 h-3 w-3 shrink-0" />
+                      <span>
+                        Runs on the server every minute — halts even if this dashboard is closed.
+                        This is the authoritative breaker.
+                        {risk.flatten_on_halt
+                          ? ' Also squares off all open positions on halt.'
+                          : ''}
+                      </span>
+                    </p>
+                  </div>
+                ) : (
+                  <p className="mt-2 flex items-start gap-1.5 text-xs text-muted-foreground">
+                    <Info className="mt-0.5 h-3 w-3 shrink-0" />
+                    <span>
+                      Server breaker status unavailable — controls disabled. Use Refresh to retry.
+                    </span>
+                  </p>
+                )}
               </div>
-              <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <Info className="h-3 w-3 shrink-0" />
-                <span title="This circuit breaker runs only in this browser tab while the dashboard is open. If the tab is closed it will not fire. It is a dashboard-side safeguard, not a server-side guarantee.">
-                  Acts while this dashboard is open — a browser-side safeguard, not a server-side
-                  guarantee.
-                </span>
-              </p>
+
+              {/* BROWSER-SIDE (this-tab-only) secondary safeguard + manual Halt now */}
+              <div className="flex flex-col gap-1">
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Switch
+                      checked={autoHalt}
+                      onCheckedChange={setAutoHalt}
+                      aria-label="Local (this-tab-only) auto-halt on daily loss limit"
+                    />
+                    Local safeguard (this tab only) — halt all if day P&amp;L below
+                  </label>
+                  <Input
+                    type="number"
+                    value={lossLimit}
+                    onChange={(e) => setLossLimit(Number(e.target.value))}
+                    className="h-8 w-28 font-mono"
+                    aria-label="Local daily loss limit"
+                  />
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={() => setConfirming('halt-now')}
+                    disabled={busy || onCount === 0}
+                  >
+                    <Power className="h-4 w-4 mr-2" />
+                    Halt now
+                  </Button>
+                </div>
+                <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
+                  <Info className="mt-0.5 h-3 w-3 shrink-0" />
+                  <span title="This safeguard runs only in this browser tab while the dashboard is open. If the tab is closed it will not fire. Use the server-side breaker above for always-on protection.">
+                    Secondary fast-reaction safeguard — acts only in this browser tab while the
+                    dashboard is open, not a server-side guarantee.
+                  </span>
+                </p>
+              </div>
             </div>
           </CardHeader>
           <CardContent>
@@ -963,12 +1214,25 @@ export default function Autonomous() {
                           className={`${!on || engineOff ? 'opacity-50' : ''} ${lag ? 'bg-red-500/5' : ''}`}
                         >
                           <TableCell>
-                            <Switch
-                              checked={on && !engineOff}
-                              disabled={rowBusy === s.id || busy || engineOff}
-                              onCheckedChange={() => handleToggle(s)}
-                              aria-label={`Toggle ${s.name}`}
-                            />
+                            <span
+                              title={
+                                serverHalted && !(on && !engineOff)
+                                  ? 'Starts are blocked until the circuit breaker is reset'
+                                  : undefined
+                              }
+                            >
+                              <Switch
+                                checked={on && !engineOff}
+                                disabled={
+                                  rowBusy === s.id ||
+                                  busy ||
+                                  engineOff ||
+                                  (serverHalted && !(on && !engineOff))
+                                }
+                                onCheckedChange={() => handleToggle(s)}
+                                aria-label={`Toggle ${s.name}`}
+                              />
+                            </span>
                           </TableCell>
                           <TableCell>
                             <div className="flex items-center gap-2">

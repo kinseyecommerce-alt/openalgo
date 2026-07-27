@@ -62,6 +62,26 @@ export interface WatchlistsData {
   watchlists: ScreenedWatchlist[]
 }
 
+// Server-side (authoritative) portfolio circuit breaker. Runs on the server
+// every minute and halts all strategies even when this dashboard is closed.
+export interface RiskStatus {
+  enabled: boolean
+  daily_loss_limit: number
+  flatten_on_halt: boolean
+  halted: boolean
+  halted_at: string | null
+  halted_reason: string | null
+  halted_pnl: number | null
+  day_pnl: number
+  breaching: boolean
+}
+
+export interface RiskUpdate {
+  enabled?: boolean
+  daily_loss_limit?: number
+  flatten_on_halt?: boolean
+}
+
 export const autonomousApi = {
   /**
    * Per-strategy and portfolio P&L for the logged-in user.
@@ -88,6 +108,34 @@ export const autonomousApi = {
    */
   getWatchlists: async (): Promise<ApiResponse<WatchlistsData>> => {
     const response = await webClient.get<ApiResponse<WatchlistsData>>('/python/api/watchlists')
+    return response.data
+  },
+
+  /**
+   * Server-side (authoritative) circuit-breaker status. Session route
+   * (webClient). The breaker runs on the server every minute — it halts even
+   * when this dashboard is closed.
+   */
+  getRisk: async (): Promise<ApiResponse<RiskStatus>> => {
+    const response = await webClient.get<ApiResponse<RiskStatus>>('/python/api/risk')
+    return response.data
+  },
+
+  /**
+   * Update the server-side circuit-breaker config (enable, loss limit,
+   * flatten-on-halt). Session route (webClient) — POST auto-sends CSRF.
+   */
+  updateRisk: async (body: RiskUpdate): Promise<ApiResponse<RiskStatus>> => {
+    const response = await webClient.post<ApiResponse<RiskStatus>>('/python/api/risk', body)
+    return response.data
+  },
+
+  /**
+   * Clear a tripped server-side breaker so strategies can be started again.
+   * Session route (webClient).
+   */
+  resetRisk: async (): Promise<ApiResponse<RiskStatus>> => {
+    const response = await webClient.post<ApiResponse<RiskStatus>>('/python/api/risk/reset', {})
     return response.data
   },
 }
