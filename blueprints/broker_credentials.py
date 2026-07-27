@@ -9,6 +9,7 @@ import re
 
 from flask import Blueprint, jsonify, request
 
+from limiter import limiter
 from utils.logging import get_logger
 from utils.session import check_session_validity
 
@@ -59,10 +60,14 @@ def update_env_value(content: str, key: str, value: str) -> str:
         # Use single quotes (no escaping needed)
         new_value = f"'{value}'"
 
-    replacement = rf"\g<1>{new_value}"
-
-    # Try to replace existing key
-    new_content, count = re.subn(pattern, replacement, content, flags=re.MULTILINE)
+    # Replace via a function so backslash sequences in the value (e.g. a
+    # password containing "\1" or "\w") are treated literally and never
+    # interpreted as regex backreferences/escapes, which would corrupt the
+    # .env write or raise re.error. Capture group 1 (the "KEY = " prefix) is
+    # re-emitted from the match itself.
+    new_content, count = re.subn(
+        pattern, lambda m: m.group(1) + new_value, content, flags=re.MULTILINE
+    )
 
     if count == 0:
         # Key doesn't exist, append it
@@ -103,6 +108,48 @@ def mask_secret(value: str, show_chars: int = 4) -> str:
         # mask suffix to avoid revealing the entire short value.
         return "*" * 8
     return value[:show_chars] + "*" * 8
+
+
+# Environment variable names for the Zerodha auto-login (TOTP) feature.
+# BROKER_API_KEY / BROKER_API_SECRET are handled by the /credentials route.
+AUTOLOGIN_ENV_KEYS = {
+    "user_id": "ZERODHA_USER_ID",
+    "password": "ZERODHA_PASSWORD",
+    "totp_secret": "ZERODHA_TOTP_SECRET",
+}
+
+
+def autologin_status_from_env(env: dict) -> dict:
+    """Compute the auto-login settings status from an env mapping.
+
+    Pure, network-free, and secret-safe. Reads only ZERODHA_USER_ID /
+    ZERODHA_PASSWORD / ZERODHA_TOTP_SECRET from ``env``.
+
+    Returns a dict with:
+      - fields: {"user_id": bool, "password": bool, "totp_secret": bool}
+        whether each var is set (non-empty after strip).
+      - configured: bool, True only when all three are set.
+      - masked: {"user_id": "<mask_secret of ZERODHA_USER_ID or ''>"}. ONLY the
+        user_id is masked/echoed. The password and totp_secret values are NEVER
+        included in any form (not even masked) -- callers get booleans only.
+    """
+    def _is_set(var: str) -> bool:
+        return bool((env.get(var) or "").strip())
+
+    fields = {
+        "user_id": _is_set(AUTOLOGIN_ENV_KEYS["user_id"]),
+        "password": _is_set(AUTOLOGIN_ENV_KEYS["password"]),
+        "totp_secret": _is_set(AUTOLOGIN_ENV_KEYS["totp_secret"]),
+    }
+    return {
+        "fields": fields,
+        "configured": all(fields.values()),
+        # SECURITY: only user_id is ever echoed, and only masked. password and
+        # totp_secret are intentionally absent -- do not add them here.
+        "masked": {
+            "user_id": mask_secret((env.get(AUTOLOGIN_ENV_KEYS["user_id"]) or "").strip()),
+        },
+    }
 
 
 def get_broker_from_redirect_url(redirect_url: str) -> str:
@@ -220,9 +267,9 @@ def update_credentials():
             # Validate broker name
             broker_name = get_broker_from_redirect_url(redirect_url)
             valid_brokers_str = get_env_value("VALID_BROKERS")
-            valid_brokers = set(
+            valid_brokers = {
                 b.strip().lower() for b in valid_brokers_str.split(",") if b.strip()
-            )
+            }
 
             if broker_name and broker_name not in valid_brokers:
                 return jsonify(
@@ -381,3 +428,110 @@ def get_capabilities():
         )
 
     return jsonify({"status": "success", "data": capabilities})
+
+
+@broker_credentials_bp.route("/autologin", methods=["GET"])
+@check_session_validity
+def get_autologin_settings():
+    """Get Zerodha auto-login (TOTP) settings status.
+
+    Never returns password/totp_secret content in any form; user_id is masked.
+    """
+    try:
+        data = autologin_status_from_env(os.environ)
+        return jsonify({"status": "success", "data": data})
+    except Exception as e:
+        logger.exception(f"Error getting auto-login settings: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@broker_credentials_bp.route("/autologin", methods=["POST"])
+@check_session_validity
+def update_autologin_settings():
+    """Update Zerodha auto-login (TOTP) credentials in the .env file.
+
+    Body keys: user_id, password, totp_secret (all optional).
+      - present and non-empty string -> written to the matching ZERODHA_* var.
+      - omitted or empty string      -> left unchanged (not cleared).
+      - explicit null                -> cleared (written as empty).
+
+    Logs only which field NAMES were updated, never their values. The response
+    is the GET shape (booleans + masked user_id only).
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+
+        # Read current .env content.
+        content, error = read_env_file()
+        if error:
+            return jsonify(
+                {"status": "error", "message": f"Failed to read .env file: {error}"}
+            ), 500
+
+        updated_fields = []
+        for body_key, env_var in AUTOLOGIN_ENV_KEYS.items():
+            if body_key not in data:
+                # Omitted -> leave unchanged.
+                continue
+            value = data[body_key]
+            if value is None:
+                # Explicit clear.
+                content = update_env_value(content, env_var, "")
+                updated_fields.append(env_var)
+                continue
+            value = str(value).strip()
+            if not value:
+                # Empty string -> leave unchanged (do not clear).
+                continue
+            content = update_env_value(content, env_var, value)
+            updated_fields.append(env_var)
+
+        if not updated_fields:
+            return jsonify(
+                {"status": "error", "message": "No auto-login fields provided to update"}
+            ), 400
+
+        # Write updated content back to .env (same sequence as update_credentials).
+        env_path = get_env_path()
+        try:
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            # Log only field names, never values.
+            logger.info(f"Updated Zerodha auto-login settings: {', '.join(updated_fields)}")
+        except Exception as e:
+            logger.exception(f"Error writing .env file: {e}")
+            return jsonify({"status": "error", "message": f"Failed to write .env file: {e}"}), 500
+
+        return jsonify({"status": "success", "data": autologin_status_from_env(os.environ)})
+
+    except Exception as e:
+        logger.exception(f"Error updating auto-login settings: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@broker_credentials_bp.route("/autologin/run", methods=["POST"])
+@limiter.limit("6 per minute")
+@check_session_validity
+def run_autologin():
+    """Manually trigger the Zerodha auto-login now.
+
+    Resolves the session user and calls run_auto_login, whose returned message
+    is already redacted. Never logs or returns any secret value.
+    """
+    from flask import session
+
+    try:
+        user = session.get("user")
+        if not user:
+            return jsonify({"status": "error", "message": "No user in session"}), 400
+
+        from broker.zerodha.api.auto_login import run_auto_login
+
+        ok, message = run_auto_login(user)
+        if ok:
+            return jsonify({"status": "success", "message": message}), 200
+        return jsonify({"status": "error", "message": message}), 400
+
+    except Exception as e:
+        logger.exception(f"Error running auto-login: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500

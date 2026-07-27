@@ -13,6 +13,7 @@ import {
   Circle,
   Info,
   PauseCircle,
+  Plug,
   Power,
   RefreshCw,
   ShieldAlert,
@@ -777,9 +778,13 @@ export default function Autonomous() {
             {fundsError ? (
               <>
                 <span className="h-2 w-2 rounded-full bg-amber-500" />
-                <span className="text-amber-600 dark:text-amber-400">Session check failed</span>
-                <a href="/broker" className="text-muted-foreground underline hover:text-foreground">
-                  Re-login
+                <span className="text-amber-600 dark:text-amber-400">Broker not connected</span>
+                <a
+                  href="/settings/broker"
+                  className="inline-flex items-center gap-1 rounded-md bg-primary px-2 py-0.5 text-xs font-semibold text-primary-foreground hover:bg-primary/90"
+                >
+                  <Plug className="h-3 w-3" />
+                  Connect
                 </a>
               </>
             ) : funds ? (
@@ -821,6 +826,15 @@ export default function Autonomous() {
               IST heuristic
             </span>
           </div>
+
+          {/* Broker settings shortcut */}
+          <a
+            href="/settings/broker"
+            className="ml-auto inline-flex items-center gap-1.5 text-muted-foreground underline hover:text-foreground"
+          >
+            <Plug className="h-3.5 w-3.5" />
+            Broker settings
+          </a>
         </CardContent>
       </Card>
 

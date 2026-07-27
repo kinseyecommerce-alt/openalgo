@@ -18,6 +18,7 @@ import {
   type LucideIcon,
   MessageCircle,
   MessageSquare,
+  Plug,
   Search,
   Settings,
   TrendingUp,
@@ -66,6 +67,7 @@ export const mobileSheetItems = navItems.filter((item) => !bottomNavPaths.includ
 // Profile dropdown menu items
 export const profileMenuItems: NavItem[] = [
   { href: '/profile', label: 'Profile', icon: User },
+  { href: '/settings/broker', label: 'Broker Settings', icon: Plug },
   { href: '/apikey', label: 'API Key', icon: Key },
   { href: '/action-center', label: 'Action Center', icon: Bell },
   { href: '/master-contract', label: 'Master Contract', icon: FileStack },
