@@ -301,6 +301,33 @@ MCX square-off cutoffs (already defaulted). Recommendation: schedule the resolve
 once daily pre-session (e.g. before the MCX morning open) so the watchlist always
 holds the live near-month set.
 
+## NFO index-futures resolver
+
+NIFTY and BANKNIFTY are **indices** (`NSE_INDEX`, quote-only) — you cannot place
+an order on the index itself. The tradable instrument is the index **future** on
+NFO (`NIFTY29MAY25FUT`), which rolls monthly, so a hardcoded symbol goes stale.
+`strategies/nfo_resolver.py` is the NFO counterpart of the MCX resolver: it turns
+index BASE names (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50, ...) into
+the current tradable near-month FUT symbols and writes them to
+`strategies/watchlists/NFO.txt` — the screened file the scanning strategies
+auto-consume via `watchlist_loader` when `WATCHLIST` is unset on NFO.
+
+It shares the MCX resolver's tested date logic and FUT symbol builder, and uses
+the same two-tier search anchoring so a `NIFTY` query resolves to the NIFTY
+future (exact name) and never to `NIFTYNXT50` or `BANKNIFTY`. Each index is
+resolved independently in try/except; one bad name never crashes the run.
+
+```bash
+uv run python strategies/nfo_resolver.py --user <id> \
+    [--indices NIFTY,BANKNIFTY] [--indices-file path] \
+    [--min-days-to-expiry 2] [--dry-run] \
+    [--allow-empty] [--watchlist-dir strategies/watchlists] [--sleep 0.2]
+```
+
+Run a scanning strategy instance with `EXCHANGE=NFO` and leave `WATCHLIST` unset;
+it will read the resolved `NFO.txt`. Same daily-pre-session scheduling
+recommendation as MCX so the watchlist always holds the live near-month set.
+
 ## Safety Features
 
 - Process isolation prevents strategy crashes from affecting the system
