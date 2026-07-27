@@ -88,14 +88,16 @@ def log(message: str) -> None:
 
 # strptime patterns tried in order. Covers the formats OpenAlgo/Kite emit:
 # "26-AUG-25", "26-AUG-2025", "2025-08-26", "28AUG25", "28AUG2025". %b matches
-# month abbreviations case-insensitively in CPython.
+# month abbreviations case-insensitively in CPython. Deliberately NO numeric
+# "%d-%m-%Y" pattern: Kite always uses the 3-letter month, and admitting a
+# numeric month would mis-parse an ambiguous date (e.g. 01-02-2025) rather
+# than correctly rejecting it.
 _EXPIRY_FORMATS = (
     "%d-%b-%y",
     "%d-%b-%Y",
     "%Y-%m-%d",
     "%d%b%y",
     "%d%b%Y",
-    "%d-%m-%Y",
 )
 
 
@@ -299,6 +301,15 @@ def _search_symbol(client, base: str, front_raw: str) -> str | None:
     if not data:
         return None
     base_u = base.strip().upper()
+    # Kite's search is a substring match, so query "CRUDEOIL" also returns the
+    # mini "CRUDEOILM". Matching by symbol-prefix alone would wrongly accept the
+    # mini (CRUDEOILM...FUT startswith CRUDEOIL), trading the wrong commodity.
+    # Guard against that with two anchored tiers:
+    #   1. exact instrument name == base (authoritative), else
+    #   2. symbol prefix == base AND the next char is a DIGIT (the expiry day),
+    #      so CRUDEOIL does not match CRUDEOILM (next char 'M', not a digit).
+    exact_match = None
+    prefix_match = None
     for item in data:
         if not isinstance(item, dict):
             continue
@@ -307,14 +318,16 @@ def _search_symbol(client, base: str, front_raw: str) -> str | None:
         sym = item.get("symbol")
         if not isinstance(sym, str) or not sym:
             continue
-        name = str(item.get("name", "")).upper()
-        # Match the base either by the instrument name or by the symbol prefix.
-        if base_u not in (name, "") and not sym.upper().startswith(base_u):
-            continue
         if parse_expiry(item.get("expiry")) != front_parsed:
             continue
-        return sym
-    return None
+        name = str(item.get("name", "")).upper()
+        sym_u = sym.upper()
+        if name == base_u:
+            exact_match = exact_match or sym  # first exact-name hit wins
+        elif sym_u.startswith(base_u) and len(sym_u) > len(base_u) and sym_u[len(base_u)].isdigit():
+            prefix_match = prefix_match or sym
+    # Exact name is authoritative; the digit-anchored prefix is the fallback.
+    return exact_match or prefix_match
 
 
 def resolve_commodity(client, base: str, today: tuple[int, int, int], min_days: int) -> str | None:
@@ -417,6 +430,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sleep", type=float, default=0.2, help="Seconds between API calls")
     parser.add_argument("--dry-run", action="store_true", help="Print result, do not write")
+    parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="Write an empty watchlist when nothing resolves (default: refuse, "
+        "to avoid silently disabling MCX trading on a transient API outage)",
+    )
     parser.add_argument("--watchlist-dir", help="Output dir (default strategies/watchlists)")
     return parser
 
@@ -485,6 +504,20 @@ def main(argv: list[str] | None = None) -> int:
         for s in resolved:
             log(f"  {s}")
         return 0
+
+    # Refuse to overwrite a good watchlist with an empty one on a total
+    # resolution failure: load_watchlist treats an existing MCX.txt as
+    # authoritative even when empty, so writing [] after a transient API
+    # outage would SILENTLY stop all MCX trading. A transient failure is
+    # indistinguishable from a genuine "no live contracts", so require an
+    # explicit --allow-empty to write an empty list.
+    if not resolved and not args.allow_empty:
+        log(
+            f"Resolved 0 commodities - NOT writing {target} (would disable MCX "
+            f"trading). Existing watchlist left untouched. Pass --allow-empty to "
+            f"override (e.g. a genuine no-contracts day)."
+        )
+        return 1
 
     header = [
         "OpenAlgo MCX near-month FUT watchlist (auto-resolved)",

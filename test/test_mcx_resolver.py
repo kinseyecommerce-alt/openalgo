@@ -18,11 +18,26 @@ sys.path.insert(
 )
 
 from mcx_resolver import (
+    _search_symbol,
     build_mcx_symbol,
     normalize_base_names,
     parse_expiry,
     pick_front_month,
 )
+
+
+class _FakeClient:
+    """Minimal stand-in for the openalgo SDK client: canned search() response."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def search(self, query=None, exchange=None):
+        # Substring match, mimicking Kite's ilike("%term%") behavior, so a query
+        # for CRUDEOIL also surfaces CRUDEOILM (the collision the resolver guards).
+        q = (query or "").upper()
+        data = [r for r in self._rows if q in str(r.get("name", "")).upper()]
+        return {"status": "success", "data": data}
 
 
 class TestParseExpiry:
@@ -37,6 +52,67 @@ class TestParseExpiry:
 
     def test_compact(self):
         assert parse_expiry("28AUG25") == (2025, 8, 28)
+
+    def test_numeric_month_rejected(self):
+        # A numeric-month date is ambiguous (day-vs-month) and Kite never emits
+        # it; the resolver must reject it, not silently mis-parse to Feb 1.
+        assert parse_expiry("01-02-2025") is None
+
+
+class TestSearchSymbolAnchoring:
+    # Both the full CRUDEOIL and the mini CRUDEOILM share the same expiry, and
+    # Kite's substring search returns both for query "CRUDEOIL".
+    ROWS = [
+        {
+            "name": "CRUDEOILM",
+            "symbol": "CRUDEOILM18AUG25FUT",
+            "expiry": "18-AUG-25",
+            "instrumenttype": "FUT",
+        },
+        {
+            "name": "CRUDEOIL",
+            "symbol": "CRUDEOIL18AUG25FUT",
+            "expiry": "18-AUG-25",
+            "instrumenttype": "FUT",
+        },
+    ]
+
+    def test_exact_name_wins_over_mini(self):
+        # base CRUDEOIL must resolve to the full contract, never the mini.
+        client = _FakeClient(self.ROWS)
+        assert _search_symbol(client, "CRUDEOIL", "18-AUG-25") == "CRUDEOIL18AUG25FUT"
+
+    def test_mini_resolves_to_itself(self):
+        client = _FakeClient(self.ROWS)
+        assert _search_symbol(client, "CRUDEOILM", "18-AUG-25") == "CRUDEOILM18AUG25FUT"
+
+    def test_no_expiry_match_returns_none(self):
+        client = _FakeClient(self.ROWS)
+        assert _search_symbol(client, "CRUDEOIL", "17-SEP-25") is None
+
+    def test_prefix_without_exact_name_needs_digit_anchor(self):
+        # Only a mini exists (name GOLDM); a query for GOLD must NOT accept it
+        # via prefix, because the char after "GOLD" is "M", not an expiry digit.
+        rows = [
+            {
+                "name": "GOLDM",
+                "symbol": "GOLDM05AUG25FUT",
+                "expiry": "05-AUG-25",
+                "instrumenttype": "FUT",
+            }
+        ]
+        assert _search_symbol(_FakeClient(rows), "GOLD", "05-AUG-25") is None
+
+    def test_skips_non_fut(self):
+        rows = [
+            {
+                "name": "CRUDEOIL",
+                "symbol": "CRUDEOIL18AUG25CE",
+                "expiry": "18-AUG-25",
+                "instrumenttype": "CE",
+            }
+        ]
+        assert _search_symbol(_FakeClient(rows), "CRUDEOIL", "18-AUG-25") is None
 
     def test_compact_full_year(self):
         assert parse_expiry("28AUG2025") == (2025, 8, 28)
