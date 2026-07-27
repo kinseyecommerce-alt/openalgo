@@ -271,6 +271,36 @@ The "session today" lookup uses the same calendar DB that powers `/api/v1/market
 | MCX | SPECIAL_SESSION 18:00-00:15 next day | Same; user's `schedule_stop` should be 23:59 to honor most of the window |
 | CRYPTO | 24/7 | Unaffected |
 
+## MCX commodity resolver
+
+MCX futures roll every month, so a fixed symbol like `CRUDEOIL20MAY24FUT` goes
+stale within weeks. `strategies/mcx_resolver.py` turns BASE commodity names
+(CRUDEOIL, GOLDM, SILVERM, NATURALGAS, COPPER, ...) into the current tradable
+NEAR-MONTH FUT symbols and writes them to `strategies/watchlists/MCX.txt` — the
+same screened file the scanning strategies auto-consume via `watchlist_loader`
+when `WATCHLIST` is unset on MCX. Run it and the next strategy start picks up the
+freshly resolved contracts; no monthly symbol edits.
+
+It prefers the concrete tradable symbol returned by the SDK's `search`
+(authoritative), falling back to string-building the documented master-contract
+format (`name + expiry.replace('-','') + 'FUT'`) only when needed. Each
+commodity is resolved independently in try/except — one bad name never crashes
+the run.
+
+```bash
+uv run python strategies/mcx_resolver.py --user <id> \
+    [--commodities CRUDEOIL,GOLDM,SILVERM,NATURALGAS,COPPER] \
+    [--commodities-file path] [--min-days-to-expiry 2] \
+    [--dry-run] [--watchlist-dir strategies/watchlists] [--sleep 0.2]
+```
+
+`--min-days-to-expiry N` rolls early by skipping a contract expiring within N
+days. The API key comes from `OPENALGO_API_KEY`, else the local DB for `--user`;
+no secret is logged. MCX strategies still need `EXCHANGE=MCX` set and use the
+MCX square-off cutoffs (already defaulted). Recommendation: schedule the resolver
+once daily pre-session (e.g. before the MCX morning open) so the watchlist always
+holds the live near-month set.
+
 ## Safety Features
 
 - Process isolation prevents strategy crashes from affecting the system
