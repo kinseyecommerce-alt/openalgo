@@ -1,0 +1,162 @@
+# Deploy OpenAlgo to a VM over SSH.
+#
+# Why this exists: the assistant working on this repo cannot SSH out (port 22 is
+# blocked from its sandbox), but it CAN push commits and read Actions logs.
+# GitHub's runners have unrestricted SSH, so this workflow is the deploy arm:
+# push -> runner builds the frontend and rsyncs -> service restarts -> logs and
+# a health check come back through the Actions API.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   DEPLOY_HOST       server IP or hostname (e.g. the Lightsail static IP)
+#   DEPLOY_USER       SSH user (e.g. ubuntu)
+#   DEPLOY_SSH_KEY    private key whose public half is in the server's
+#                     ~/.ssh/authorized_keys
+# Optional:
+#   DEPLOY_PORT       SSH port (default 22)
+#   DEPLOY_PATH       app directory (default /opt/openalgo)
+#   HEALTHCHECK_URL   URL to verify after restart (e.g. https://your.domain/)
+#
+# The server's .env is NEVER touched by this workflow. Broker credentials live
+# on the server only and never pass through CI.
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to deploy (defaults to the triggering ref)
+        required: false
+        type: string
+
+# Never let two deploys interleave on the same box.
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check required secrets
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          missing=""
+          [ -z "$HOST" ] && missing="$missing DEPLOY_HOST"
+          [ -z "$USER" ] && missing="$missing DEPLOY_USER"
+          [ -z "$KEY" ]  && missing="$missing DEPLOY_SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # Built on the runner so the server needs no Node toolchain at all, and so
+      # a feature branch (where frontend/dist is gitignored) still deploys a
+      # current UI rather than whatever CI last committed to main.
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Pin the host key on first contact rather than disabling checking.
+          ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Rsync application
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
+          APP_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -p ${PORT:-22} -o StrictHostKeyChecking=yes" \
+            --exclude '.git' \
+            --exclude '.env' \
+            --exclude 'db/' \
+            --exclude 'log/' \
+            --exclude 'strategies/scripts/' \
+            --exclude 'strategies/watchlists/' \
+            --exclude 'strategies/risk_config.json' \
+            --exclude 'node_modules' \
+            --exclude 'frontend/node_modules' \
+            ./ "$USER@$HOST:${APP_PATH:-/opt/openalgo}/"
+
+      - name: Sync dependencies and restart
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
+          APP_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" -o StrictHostKeyChecking=yes \
+            "$USER@$HOST" bash -se <<EOF
+          set -euo pipefail
+          cd "${APP_PATH:-/opt/openalgo}"
+          export PATH="\$HOME/.local/bin:\$PATH"
+          uv sync --frozen || uv sync
+          sudo systemctl restart openalgo
+          EOF
+
+      - name: Verify service is up
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          # Give gunicorn a moment, then require the unit to be active. A failed
+          # deploy must fail the job loudly, not look green while the app is down.
+          sleep 10
+          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" -o StrictHostKeyChecking=yes \
+            "$USER@$HOST" 'systemctl is-active --quiet openalgo && echo "openalgo: active" || (echo "::error::openalgo failed to start"; journalctl -u openalgo -n 60 --no-pager; exit 1)'
+
+      - name: Health check
+        env:
+          URL: ${{ secrets.HEALTHCHECK_URL }}
+        run: |
+          # The `secrets` context is not available in step-level `if`, so the
+          # optional-secret check happens here rather than as a condition.
+          if [ -z "$URL" ]; then
+            echo "HEALTHCHECK_URL not set - skipping HTTP health check."
+            exit 0
+          fi
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL" || echo 000)
+            if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then
+              echo "Health check OK (HTTP $code)"
+              exit 0
+            fi
+            echo "attempt $i: HTTP $code"
+            sleep 6
+          done
+          echo "::error::Health check failed at $URL"
+          exit 1
+
+      - name: Clean up key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
