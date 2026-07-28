@@ -56,6 +56,10 @@ _DEFAULTS = {
     "capital_mode": "percent",
     "capital_amount": 0.0,
     "capital_percent": 100.0,
+    # Pre-trade hard cap (see services/capital_guard_service.py). Off by
+    # default: turning it on starts rejecting exposure-increasing orders.
+    "capital_guard_enabled": False,
+    "max_positions": 10,
 }
 
 
@@ -149,6 +153,13 @@ def _coerce_config(raw: dict) -> dict:
                 cfg[key] = float(raw.get(key, _DEFAULTS[key]))
             except (TypeError, ValueError):
                 cfg[key] = _DEFAULTS[key]
+        cfg["capital_guard_enabled"] = bool(
+            raw.get("capital_guard_enabled", _DEFAULTS["capital_guard_enabled"])
+        )
+        try:
+            cfg["max_positions"] = int(raw.get("max_positions", _DEFAULTS["max_positions"]))
+        except (TypeError, ValueError):
+            cfg["max_positions"] = _DEFAULTS["max_positions"]
 
         cfg["halted_at"] = raw.get("halted_at")
         cfg["halted_reason"] = raw.get("halted_reason")
@@ -267,6 +278,14 @@ def update_risk_config(config_path: Path | str | None = None, **fields) -> dict:
             if hi is not None and val > hi:
                 raise ValueError(f"{key} must not exceed {hi:g}")
             capital_nums[key] = val
+    max_positions_val = None
+    if "max_positions" in fields:
+        try:
+            max_positions_val = int(fields["max_positions"])
+        except (TypeError, ValueError) as e:
+            raise ValueError("max_positions must be a whole number") from e
+        if max_positions_val < 0:
+            raise ValueError("max_positions must not be negative")
 
     with _CONFIG_LOCK:
         # Re-read the freshest on-disk config UNDER the lock so we never write a
@@ -283,6 +302,10 @@ def update_risk_config(config_path: Path | str | None = None, **fields) -> dict:
             cfg["flatten_on_halt"] = bool(fields["flatten_on_halt"])
         if "capital_mode" in fields:
             cfg["capital_mode"] = fields["capital_mode"]
+        if "capital_guard_enabled" in fields:
+            cfg["capital_guard_enabled"] = bool(fields["capital_guard_enabled"])
+        if "max_positions" in fields:
+            cfg["max_positions"] = max_positions_val
         cfg.update(capital_nums)
 
         save_risk_config(cfg, config_path)

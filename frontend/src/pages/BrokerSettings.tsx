@@ -124,6 +124,8 @@ export default function BrokerSettings() {
   const [capitalMode, setCapitalMode] = useState<'percent' | 'amount'>('percent')
   const [percentInput, setPercentInput] = useState('')
   const [amountInput, setAmountInput] = useState('')
+  const [guardEnabled, setGuardEnabled] = useState(false)
+  const [maxPositionsInput, setMaxPositionsInput] = useState('')
   const [savingCapital, setSavingCapital] = useState(false)
 
   const loadProbe = useCallback(async () => {
@@ -154,6 +156,8 @@ export default function BrokerSettings() {
         setCapitalMode(res.data.capital_mode)
         setPercentInput(String(res.data.percent))
         setAmountInput(String(res.data.amount))
+        setGuardEnabled(res.data.capital_guard_enabled)
+        setMaxPositionsInput(String(res.data.max_positions))
       } else {
         setCapitalError(true)
       }
@@ -165,9 +169,23 @@ export default function BrokerSettings() {
   const saveCapital = useCallback(async () => {
     setSavingCapital(true)
     try {
-      const body: { mode: 'percent' | 'amount'; percent?: number; amount?: number } = {
+      const body: {
+        mode: 'percent' | 'amount'
+        percent?: number
+        amount?: number
+        guard_enabled: boolean
+        max_positions: number
+      } = {
         mode: capitalMode,
+        guard_enabled: guardEnabled,
+        max_positions: 0,
       }
+      const maxPos = Number(maxPositionsInput)
+      if (!Number.isInteger(maxPos) || maxPos < 0) {
+        showToast.error('Max positions must be a whole number (0 disables the limit)')
+        return
+      }
+      body.max_positions = maxPos
       // Send only the field that governs the chosen basis, so a stale value in
       // the other input can never be silently persisted as the allocation.
       if (capitalMode === 'percent') {
@@ -197,7 +215,7 @@ export default function BrokerSettings() {
     } finally {
       setSavingCapital(false)
     }
-  }, [capitalMode, percentInput, amountInput, loadCapital])
+  }, [capitalMode, percentInput, amountInput, guardEnabled, maxPositionsInput, loadCapital])
 
   const loadMode = useCallback(async () => {
     try {
@@ -714,6 +732,42 @@ export default function BrokerSettings() {
                 )}
               </div>
 
+              {/* Pre-trade hard cap */}
+              <div className="space-y-3 rounded-md border p-3">
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={guardEnabled}
+                    onChange={(e) => setGuardEnabled(e.target.checked)}
+                    className="mt-1"
+                  />
+                  <span>
+                    <span className="font-medium">Enforce as a hard limit</span>
+                    <span className="block text-xs text-muted-foreground">
+                      Reject any order that would commit more than the allocation or exceed the
+                      position limit. Applies to live and sandbox alike. Exits are never blocked.
+                    </span>
+                  </span>
+                </label>
+
+                <div className="space-y-1.5">
+                  <Label htmlFor="max-positions">Max concurrent positions</Label>
+                  <Input
+                    id="max-positions"
+                    type="number"
+                    min={0}
+                    step="1"
+                    value={maxPositionsInput}
+                    onChange={(e) => setMaxPositionsInput(e.target.value)}
+                    className="max-w-[160px] font-mono"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    0 disables the count check. Adding to a position you already hold does not
+                    consume a slot.
+                  </p>
+                </div>
+              </div>
+
               {capital.clamped && (
                 <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
                   <Info className="mt-0.5 h-3 w-3 shrink-0" />
@@ -744,13 +798,16 @@ export default function BrokerSettings() {
                 <Info className="mt-0.5 h-3 w-3 shrink-0" />
                 <span>
                   Capital is read from your broker account, never typed in, and the allocation is
-                  capped at available cash. This records how much of the account you intend to
-                  commit today and is shown here and via the API — it does <strong>not</strong> by
-                  itself block orders. The automatic stop is the daily loss limit on the{' '}
+                  capped at available cash. With the hard limit on, orders that would commit more
+                  than the allocation — or open more than the position limit — are rejected before
+                  reaching the broker; orders that reduce or close a position always go through, so
+                  you can never be trapped in a trade. If the position data cannot be read the order
+                  is allowed and logged, since an entry cannot be told from an exit without it — the
+                  daily loss limit on the{' '}
                   <a href="/autonomous" className="underline">
                     autonomous dashboard
-                  </a>
-                  .
+                  </a>{' '}
+                  remains the backstop.
                 </span>
               </p>
             </>

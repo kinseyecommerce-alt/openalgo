@@ -145,6 +145,17 @@ def place_order_with_auth(
 
     api_key = original_data.get("apikey", "")
 
+    # Pre-trade capital / position-count guard. Placed BEFORE the analyze-mode
+    # branch so the same limits apply to sandbox and live alike, and so no
+    # caller can bypass them. Exposure-reducing orders (exits) are never
+    # blocked; see services/capital_guard_service.py.
+    if api_key:
+        from services.capital_guard_service import enforce_pre_trade
+
+        guard_ok, guard_reason = enforce_pre_trade(order_data, api_key)
+        if not guard_ok:
+            return False, {"status": "error", "message": guard_reason}, 403
+
     # If in analyze mode, route to sandbox for sandbox trading
     if get_analyze_mode():
         from services.sandbox_service import sandbox_place_order

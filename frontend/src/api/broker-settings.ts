@@ -110,12 +110,19 @@ export interface CapitalStatus {
   allocated: number
   /** True when a fixed amount was reduced to fit the available cash. */
   clamped: boolean
+  /** Pre-trade hard cap: when on, exposure-increasing orders that would breach
+   *  the allocation or the position count are rejected. Exits always pass. */
+  capital_guard_enabled: boolean
+  /** Max concurrent open positions; 0 disables the count check. */
+  max_positions: number
 }
 
 export interface UpdateCapitalBody {
   mode?: 'percent' | 'amount'
   amount?: number
   percent?: number
+  guard_enabled?: boolean
+  max_positions?: number
 }
 
 export const brokerSettingsApi = {

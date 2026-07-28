@@ -205,6 +205,9 @@ def get_capital_status(user_id):
             # shows an honest error instead of a confident zero allocation.
             "funds_error": funds_error,
             "mode": "analyzer" if analyze else "live",
+            # Pre-trade hard cap (services/capital_guard_service.py).
+            "capital_guard_enabled": bool(cfg.get("capital_guard_enabled", False)),
+            "max_positions": int(cfg.get("max_positions", 0) or 0),
             **allocation,
         }
         return {"status": "success", "data": data}
@@ -213,7 +216,9 @@ def get_capital_status(user_id):
         return {"status": "error", "message": str(e)}
 
 
-def update_capital_allocation(mode=None, amount=None, percent=None):
+def update_capital_allocation(
+    mode=None, amount=None, percent=None, guard_enabled=None, max_positions=None
+):
     """Persist the allocation config, then return the refreshed status inputs.
 
     Only the provided fields are changed. Validation mirrors the pure resolver:
@@ -258,6 +263,17 @@ def update_capital_allocation(mode=None, amount=None, percent=None):
                 return {"status": "error", "message": "percent must be between 0 and 100"}
             updates["capital_percent"] = pct
 
+        if guard_enabled is not None:
+            updates["capital_guard_enabled"] = bool(guard_enabled)
+        if max_positions is not None:
+            try:
+                mp = int(max_positions)
+            except (TypeError, ValueError):
+                return {"status": "error", "message": "max_positions must be a whole number"}
+            if mp < 0:
+                return {"status": "error", "message": "max_positions must not be negative"}
+            updates["max_positions"] = mp
+
         if not updates:
             return {"status": "error", "message": "nothing to update"}
 
@@ -268,6 +284,8 @@ def update_capital_allocation(mode=None, amount=None, percent=None):
                 "capital_mode": cfg.get("capital_mode"),
                 "capital_amount": cfg.get("capital_amount"),
                 "capital_percent": cfg.get("capital_percent"),
+                "capital_guard_enabled": cfg.get("capital_guard_enabled"),
+                "max_positions": cfg.get("max_positions"),
             },
         }
     except Exception as e:

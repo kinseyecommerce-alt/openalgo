@@ -584,6 +584,8 @@ def update_capital():
             mode=data.get("mode"),
             amount=data.get("amount"),
             percent=data.get("percent"),
+            guard_enabled=data.get("guard_enabled"),
+            max_positions=data.get("max_positions"),
         )
         if result.get("status") == "success":
             return jsonify(result), 200
