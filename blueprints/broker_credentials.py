@@ -535,3 +535,59 @@ def run_autologin():
     except Exception as e:
         logger.exception(f"Error running auto-login: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@broker_credentials_bp.route("/capital", methods=["GET"])
+@check_session_validity
+def get_capital():
+    """Get the daily capital allocation, sourced from the broker's live funds.
+
+    Returns the broker's reported cash/margin plus the saved allocation and the
+    resolved effective figure. ``funds_error`` is non-null when the broker could
+    not be reached, so the UI can distinguish that from a genuine zero balance.
+    """
+    from flask import session
+
+    try:
+        user = session.get("user")
+        if not user:
+            return jsonify({"status": "error", "message": "No user in session"}), 400
+
+        from services.capital_service import get_capital_status
+
+        result = get_capital_status(user)
+        if result.get("status") == "success":
+            return jsonify(result), 200
+        return jsonify(result), 500
+    except Exception as e:
+        logger.exception(f"Error getting capital allocation: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@broker_credentials_bp.route("/capital", methods=["POST"])
+@check_session_validity
+@limiter.limit("30 per minute")
+def update_capital():
+    """Update the daily capital allocation.
+
+    Body keys (all optional): ``mode`` ("percent"/"amount"), ``amount`` (>= 0),
+    ``percent`` (0-100). Invalid values are rejected with 400 rather than being
+    coerced, so a bad request can never silently change how much capital is
+    allocated.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+
+        from services.capital_service import update_capital_allocation
+
+        result = update_capital_allocation(
+            mode=data.get("mode"),
+            amount=data.get("amount"),
+            percent=data.get("percent"),
+        )
+        if result.get("status") == "success":
+            return jsonify(result), 200
+        return jsonify(result), 400
+    except Exception as e:
+        logger.exception(f"Error updating capital allocation: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500

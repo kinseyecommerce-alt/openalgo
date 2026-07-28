@@ -82,6 +82,42 @@ export interface UpdateAutoLoginBody {
   totp_secret?: string
 }
 
+// ---------------------------------------------------------------------------
+// Daily capital allocation (GET/POST /api/broker/capital)
+// Capital is sourced from the BROKER's live funds, never typed in. The server
+// resolves the effective allocation so the UI and backend cannot disagree.
+// ---------------------------------------------------------------------------
+export interface CapitalFunds {
+  availablecash: number
+  collateral: number
+  utiliseddebits: number
+  m2mrealized: number
+  m2munrealized: number
+}
+
+export interface CapitalStatus {
+  funds: CapitalFunds
+  /** Non-null when the broker could not be reached — lets the UI distinguish
+   *  "no broker session" from a genuine zero balance. */
+  funds_error: string | null
+  mode: 'live' | 'analyzer'
+  available_cash: number
+  /** Allocation basis: a percentage of available cash, or a fixed rupee sum. */
+  capital_mode: 'percent' | 'amount'
+  percent: number
+  amount: number
+  /** The effective rupee allocation, never exceeding available_cash. */
+  allocated: number
+  /** True when a fixed amount was reduced to fit the available cash. */
+  clamped: boolean
+}
+
+export interface UpdateCapitalBody {
+  mode?: 'percent' | 'amount'
+  amount?: number
+  percent?: number
+}
+
 export const brokerSettingsApi = {
   /**
    * Masked broker API credentials + server endpoints. Session route (webClient).
@@ -134,6 +170,26 @@ export const brokerSettingsApi = {
    */
   runAutoLogin: async (): Promise<ApiResponse> => {
     const response = await webClient.post<ApiResponse>('/api/broker/autologin/run')
+    return response.data
+  },
+
+  /**
+   * Daily capital allocation with the broker's LIVE funds. The effective
+   * allocation is resolved server-side and never exceeds available cash.
+   * Session route (webClient).
+   */
+  getCapital: async (): Promise<ApiResponse<CapitalStatus>> => {
+    const response = await webClient.get<ApiResponse<CapitalStatus>>('/api/broker/capital')
+    return response.data
+  },
+
+  /**
+   * Save the allocation basis (percent of available cash, or a fixed amount).
+   * Invalid values are rejected server-side with 400 rather than coerced.
+   * Session route (webClient) — POST auto-sends the CSRF token.
+   */
+  updateCapital: async (body: UpdateCapitalBody): Promise<ApiResponse> => {
+    const response = await webClient.post<ApiResponse>('/api/broker/capital', body)
     return response.data
   },
 }

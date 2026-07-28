@@ -10,6 +10,7 @@ import {
   RefreshCw,
   Save,
   ShieldCheck,
+  Wallet,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { autonomousApi } from '@/api/autonomous'
@@ -17,6 +18,7 @@ import {
   type AutoLoginStatus,
   type BrokerCredentials,
   brokerSettingsApi,
+  type CapitalStatus,
 } from '@/api/broker-settings'
 import { tradingApi } from '@/api/trading'
 import { Badge } from '@/components/ui/badge'
@@ -116,6 +118,14 @@ export default function BrokerSettings() {
   const [savingAutoLogin, setSavingAutoLogin] = useState(false)
   const [runningAutoLogin, setRunningAutoLogin] = useState(false)
 
+  // ---- Section 4: daily capital allocation (sourced from the broker) ----
+  const [capital, setCapital] = useState<CapitalStatus | null>(null)
+  const [capitalError, setCapitalError] = useState(false)
+  const [capitalMode, setCapitalMode] = useState<'percent' | 'amount'>('percent')
+  const [percentInput, setPercentInput] = useState('')
+  const [amountInput, setAmountInput] = useState('')
+  const [savingCapital, setSavingCapital] = useState(false)
+
   const loadProbe = useCallback(async () => {
     if (!apiKey) {
       setProbe('idle')
@@ -134,6 +144,60 @@ export default function BrokerSettings() {
       setProbe('error')
     }
   }, [apiKey])
+
+  const loadCapital = useCallback(async () => {
+    setCapitalError(false)
+    try {
+      const res = await brokerSettingsApi.getCapital()
+      if (res.status === 'success' && res.data) {
+        setCapital(res.data)
+        setCapitalMode(res.data.capital_mode)
+        setPercentInput(String(res.data.percent))
+        setAmountInput(String(res.data.amount))
+      } else {
+        setCapitalError(true)
+      }
+    } catch {
+      setCapitalError(true)
+    }
+  }, [])
+
+  const saveCapital = useCallback(async () => {
+    setSavingCapital(true)
+    try {
+      const body: { mode: 'percent' | 'amount'; percent?: number; amount?: number } = {
+        mode: capitalMode,
+      }
+      // Send only the field that governs the chosen basis, so a stale value in
+      // the other input can never be silently persisted as the allocation.
+      if (capitalMode === 'percent') {
+        const pct = Number(percentInput)
+        if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
+          showToast.error('Percent must be between 0 and 100')
+          return
+        }
+        body.percent = pct
+      } else {
+        const amt = Number(amountInput)
+        if (!Number.isFinite(amt) || amt < 0) {
+          showToast.error('Amount must be 0 or more')
+          return
+        }
+        body.amount = amt
+      }
+      const res = await brokerSettingsApi.updateCapital(body)
+      if (res.status === 'success') {
+        showToast.success('Capital allocation saved')
+        await loadCapital()
+      } else {
+        showToast.error(res.message || 'Could not save capital allocation')
+      }
+    } catch {
+      showToast.error('Could not save capital allocation')
+    } finally {
+      setSavingCapital(false)
+    }
+  }, [capitalMode, percentInput, amountInput, loadCapital])
 
   const loadMode = useCallback(async () => {
     try {
@@ -180,7 +244,8 @@ export default function BrokerSettings() {
     loadMode()
     loadCreds()
     loadAutoLogin()
-  }, [loadProbe, loadMode, loadCreds, loadAutoLogin])
+    loadCapital()
+  }, [loadProbe, loadMode, loadCreds, loadAutoLogin, loadCapital])
 
   // ---- save handlers ----
   const handleSaveCreds = async () => {
@@ -539,6 +604,177 @@ export default function BrokerSettings() {
           )}
         </CardContent>
       </Card>
+
+      {/* ---- Section 4: Daily capital allocation (from the broker) ---- */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <Wallet className="h-4 w-4" />
+            Daily capital allocation
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {capitalError ? (
+            <p className="text-sm text-red-600 dark:text-red-400">
+              Could not load capital settings. Use Refresh to retry.
+            </p>
+          ) : !capital ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : (
+            <>
+              {/* Live broker funds — the source of truth, never typed in. */}
+              {capital.funds_error ? (
+                <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
+                  <p className="flex items-start gap-1.5 text-sm text-amber-700 dark:text-amber-400">
+                    <Info className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>
+                      Capital could not be read from the broker ({capital.funds_error}). Connect the
+                      broker above — no allocation is shown rather than a misleading zero.
+                    </span>
+                  </p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <FundTile
+                    label="Available cash"
+                    value={formatCurrency(capital.funds.availablecash)}
+                  />
+                  <FundTile label="Utilised" value={formatCurrency(capital.funds.utiliseddebits)} />
+                  <FundTile label="Collateral" value={formatCurrency(capital.funds.collateral)} />
+                  <FundTile
+                    label="Allocated today"
+                    value={formatCurrency(capital.allocated)}
+                    highlight
+                  />
+                </div>
+              )}
+
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Badge variant={capital.mode === 'live' ? 'default' : 'secondary'}>
+                  {capital.mode === 'live' ? 'LIVE' : 'ANALYZER'}
+                </Badge>
+                <span>
+                  {capital.mode === 'live'
+                    ? 'Figures come from your live broker account.'
+                    : 'Figures come from the sandbox account (analyzer mode).'}
+                </span>
+              </div>
+
+              {/* Allocation basis */}
+              <div className="space-y-3">
+                <Label>Allocate</Label>
+                <div className="inline-flex rounded-md border p-0.5">
+                  <Button
+                    type="button"
+                    variant={capitalMode === 'percent' ? 'default' : 'ghost'}
+                    size="sm"
+                    className="h-7 px-3"
+                    onClick={() => setCapitalMode('percent')}
+                  >
+                    % of available
+                  </Button>
+                  <Button
+                    type="button"
+                    variant={capitalMode === 'amount' ? 'default' : 'ghost'}
+                    size="sm"
+                    className="h-7 px-3"
+                    onClick={() => setCapitalMode('amount')}
+                  >
+                    Fixed amount
+                  </Button>
+                </div>
+
+                {capitalMode === 'percent' ? (
+                  <div className="space-y-1.5">
+                    <Label htmlFor="capital-percent">Percent of available cash</Label>
+                    <Input
+                      id="capital-percent"
+                      type="number"
+                      min={0}
+                      max={100}
+                      step="1"
+                      value={percentInput}
+                      onChange={(e) => setPercentInput(e.target.value)}
+                      className="max-w-[200px] font-mono"
+                    />
+                  </div>
+                ) : (
+                  <div className="space-y-1.5">
+                    <Label htmlFor="capital-amount">Fixed amount (INR)</Label>
+                    <Input
+                      id="capital-amount"
+                      type="number"
+                      min={0}
+                      step="1000"
+                      value={amountInput}
+                      onChange={(e) => setAmountInput(e.target.value)}
+                      className="max-w-[220px] font-mono"
+                    />
+                  </div>
+                )}
+              </div>
+
+              {capital.clamped && (
+                <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+                  <Info className="mt-0.5 h-3 w-3 shrink-0" />
+                  <span>
+                    The saved amount exceeds available cash, so it was reduced to{' '}
+                    {formatCurrency(capital.allocated)}. Allocation can never exceed what the broker
+                    reports.
+                  </span>
+                </p>
+              )}
+
+              <div className="flex flex-wrap gap-2">
+                <Button onClick={saveCapital} disabled={savingCapital}>
+                  {savingCapital ? (
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  ) : (
+                    <Save className="h-4 w-4 mr-2" />
+                  )}
+                  Save allocation
+                </Button>
+                <Button variant="outline" onClick={loadCapital} disabled={savingCapital}>
+                  <RefreshCw className="h-4 w-4 mr-2" />
+                  Refresh from broker
+                </Button>
+              </div>
+
+              <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
+                <Info className="mt-0.5 h-3 w-3 shrink-0" />
+                <span>
+                  Capital is read from your broker account, never typed in, and the allocation is
+                  capped at available cash. This records how much of the account you intend to
+                  commit today and is shown here and via the API — it does <strong>not</strong> by
+                  itself block orders. The automatic stop is the daily loss limit on the{' '}
+                  <a href="/autonomous" className="underline">
+                    autonomous dashboard
+                  </a>
+                  .
+                </span>
+              </p>
+            </>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+/** A small labelled figure tile for the broker funds row. */
+function FundTile({
+  label,
+  value,
+  highlight = false,
+}: {
+  label: string
+  value: string
+  highlight?: boolean
+}) {
+  return (
+    <div className={`rounded-md border p-3 ${highlight ? 'border-primary/50 bg-primary/5' : ''}`}>
+      <div className="text-xs uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="font-mono text-lg font-semibold">{value}</div>
     </div>
   )
 }
