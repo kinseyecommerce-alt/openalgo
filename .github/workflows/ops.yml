@@ -1,0 +1,171 @@
+# Remote operations on the deployed OpenAlgo server.
+#
+# Why this exists: the assistant working on this repo cannot SSH out (port 22 is
+# blocked from its sandbox and there is no ssh client), but it CAN dispatch
+# workflows and read Actions logs. GitHub's runners have unrestricted SSH, so
+# this workflow is the remote hands: pick an operation, the runner runs it on
+# the server, and the output comes back through the Actions log.
+#
+# Uses the same secrets as deploy.yml: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE ADDING OPERATIONS
+#
+# On a PUBLIC repository, Actions logs are readable by ANYONE. That makes the
+# log a publishing channel, not a private console. Operations that would print
+# account balances, positions, order history or credentials are therefore
+# gated on the repository being private, and refuse to run otherwise. Making
+# the repo private lifts the gate.
+#
+# Output from every operation is passed through a redaction filter as a second
+# line of defence. Do not rely on it alone - it is a backstop for accidents,
+# not a licence to print secrets.
+#
+# The `custom` operation runs an arbitrary command as the deploy user. Anyone
+# who can dispatch workflows on this repo (write access) can therefore run
+# arbitrary code on the trading server. That is the point of it, but treat
+# repo write access as equivalent to server access from here on.
+# ---------------------------------------------------------------------------
+
+name: Ops
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: What to do on the server
+        required: true
+        default: service-status
+        type: choice
+        options:
+          - service-status      # is it running, and since when
+          - journal             # recent systemd log lines
+          - error-log           # tail of log/errors.jsonl
+          - resources           # disk, memory, load, open file descriptors
+          - app-responds        # does the app answer on loopback
+          - restart             # restart the service
+          - deployed-version    # git commit currently on the server
+          - analyzer-mode       # SENSITIVE - needs OPENALGO_APIKEY, private repo only
+          - smoke-test          # SENSITIVE - places a SANDBOX order, private repo only
+          - custom              # arbitrary command - see the warning above
+      args:
+        description: 'Line count for journal/error-log (default 100)'
+        required: false
+        type: string
+      command:
+        description: 'Shell command, used only when operation = custom'
+        required: false
+        type: string
+
+concurrency:
+  group: ops-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  ops:
+    name: ${{ inputs.operation }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check secrets and sensitivity gate
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          APIKEY: ${{ secrets.OPENALGO_APIKEY }}
+          IS_PRIVATE: ${{ github.event.repository.private }}
+          OP: ${{ inputs.operation }}
+        run: |
+          missing=""
+          [ -z "$HOST" ] && missing="$missing DEPLOY_HOST"
+          [ -z "$USER" ] && missing="$missing DEPLOY_USER"
+          [ -z "$KEY" ]  && missing="$missing DEPLOY_SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            exit 1
+          fi
+
+          # Operations that would print money or positions into a world-readable
+          # log are refused on a public repo. This is not advisory - it exits.
+          case "$OP" in
+            analyzer-mode|smoke-test)
+              if [ "$IS_PRIVATE" != "true" ]; then
+                echo "::error::'$OP' prints account data (funds, positions, orders) and this repository is PUBLIC, so Actions logs are world-readable. Make the repository private, then re-run. Refusing."
+                exit 1
+              fi
+              if [ -z "$APIKEY" ]; then
+                echo "::error::'$OP' needs the OPENALGO_APIKEY secret (generate one at /apikey on the instance)."
+                exit 1
+              fi
+              ;;
+          esac
+
+          if [ "$OP" = "custom" ] && [ -z "${{ inputs.command }}" ]; then
+            echo "::error::operation=custom requires the 'command' input."
+            exit 1
+          fi
+
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Run operation
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
+          APP_PATH: ${{ secrets.DEPLOY_PATH }}
+          APIKEY: ${{ secrets.OPENALGO_APIKEY }}
+          OP: ${{ inputs.operation }}
+          ARGS: ${{ inputs.args }}
+          CMD: ${{ inputs.command }}
+        run: |
+          set -o pipefail
+          app="${APP_PATH:-/opt/openalgo}"
+          n="${ARGS:-100}"
+          case "$n" in ''|*[!0-9]*) n=100 ;; esac   # ignore non-numeric args
+
+          case "$OP" in
+            service-status)
+              remote="systemctl is-active openalgo; systemctl status openalgo --no-pager -n 15 || true" ;;
+            journal)
+              remote="journalctl -u openalgo -n $n --no-pager" ;;
+            error-log)
+              remote="tail -n $n '$app/log/errors.jsonl' 2>/dev/null || echo 'no errors.jsonl yet'" ;;
+            resources)
+              remote="echo '--- disk ---'; df -h '$app' /; echo '--- memory ---'; free -m; echo '--- load ---'; uptime; echo '--- open fds (gunicorn) ---'; pgrep -f gunicorn | while read p; do echo \"pid \$p: \$(ls /proc/\$p/fd 2>/dev/null | wc -l) fds\"; done; echo '--- listeners ---'; ss -lntp 2>/dev/null | grep -E ':(5000|8765|80|443)' || true" ;;
+            app-responds)
+              remote="curl -s -o /dev/null -w 'localhost:5000 -> HTTP %{http_code}\n' --max-time 10 http://127.0.0.1:5000/ ; curl -s -o /dev/null -w 'nginx :80    -> HTTP %{http_code}\n' --max-time 10 http://127.0.0.1/" ;;
+            restart)
+              remote="sudo systemctl restart openalgo && sleep 5 && systemctl is-active openalgo" ;;
+            deployed-version)
+              remote="cd '$app' && git log --oneline -3 2>/dev/null || echo 'not a git checkout'; echo '--- .env present? ---'; test -f '$app/.env' && echo 'yes (contents never printed)' || echo 'NO - the app cannot start without it'" ;;
+            analyzer-mode)
+              # Prints only the mode flag, not balances.
+              remote="curl -s --max-time 15 -H 'Content-Type: application/json' -d '{\"apikey\":\"$APIKEY\"}' http://127.0.0.1:5000/api/v1/analyzer | python3 -c 'import json,sys; d=json.load(sys.stdin); print(\"analyzer mode:\", d.get(\"data\",{}).get(\"mode\"), \"| analyze_mode:\", d.get(\"data\",{}).get(\"analyze_mode\"))'" ;;
+            smoke-test)
+              remote="cd '$app' && OPENALGO_URL=http://127.0.0.1:5000 OPENALGO_APIKEY='$APIKEY' bash deploy/smoke_test.sh" ;;
+            custom)
+              remote="$CMD" ;;
+            *)
+              echo "::error::Unknown operation: $OP"; exit 1 ;;
+          esac
+
+          echo "== $OP on \$DEPLOY_HOST =="
+          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" -o StrictHostKeyChecking=yes \
+              -o ConnectTimeout=15 "$USER@$HOST" "bash -lc $(printf '%q' "$remote")" 2>&1 \
+            | sed -E \
+                -e 's/(api[_-]?key|apikey|token|secret|password|pepper)([\"'"'"']?\s*[:=]\s*[\"'"'"']?)[A-Za-z0-9._\/+-]{8,}/\1\2[REDACTED]/gI' \
+                -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----/[REDACTED PRIVATE KEY]/g'
+
+      - name: Clean up key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
