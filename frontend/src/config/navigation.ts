@@ -78,6 +78,7 @@ export const profileMenuItems: NavItem[] = [
   { href: '/scalping', label: 'Scalping', icon: Zap },
   { href: '/python', label: 'Python Strategies', icon: Code2 },
   { href: '/autonomous', label: 'Autonomous', icon: Bot },
+  { href: '/performance', label: 'Strategy Performance', icon: TrendingUp },
   { href: '/pnl-tracker', label: 'PnL Tracker', icon: BarChart3 },
   { href: '/historify', label: 'Historify', icon: Database },
   { href: '/search/token', label: 'Search', icon: Search },

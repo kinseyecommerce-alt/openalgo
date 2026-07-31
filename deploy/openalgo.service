@@ -1,0 +1,68 @@
+# OpenAlgo systemd unit for a bare-metal VM (AWS Lightsail / EC2 / any Ubuntu).
+#
+# Install:
+#   sudo cp deploy/openalgo.service /etc/systemd/system/openalgo.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now openalgo
+#
+# Gunicorn runs with the EVENTLET worker and EXACTLY ONE worker (-w 1). Both are
+# required, not preferences: Flask-SocketIO state is in-process and cannot be
+# shared across workers, and the WebSocket/ZeroMQ plumbing assumes a single
+# process. Raising -w silently breaks live streaming.
+
+[Unit]
+Description=OpenAlgo trading platform
+Documentation=https://docs.openalgo.in
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/openalgo
+
+# uv manages the venv and dependencies; it lives in the user's ~/.local/bin.
+Environment="PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+# The .env holds broker credentials and stays on the SERVER only - it is never
+# in the repo and never passed through CI.
+EnvironmentFile=-/opt/openalgo/.env
+
+ExecStart=/home/ubuntu/.local/bin/uv run gunicorn \
+    --worker-class eventlet \
+    -w 1 \
+    --bind 127.0.0.1:5000 \
+    --timeout 120 \
+    --graceful-timeout 30 \
+    --access-logfile - \
+    --error-logfile - \
+    app:app
+
+# Give in-flight orders and the broker feed a chance to close cleanly rather
+# than being killed mid-request.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+Restart=always
+RestartSec=5
+
+# Journald captures stdout/stderr; the app also writes log/errors.jsonl.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openalgo
+
+# Modest hardening. NoNewPrivileges is safe here; the app needs write access to
+# its own directory (SQLite databases, logs, strategy files), so ProtectSystem
+# is set to full with an explicit ReadWritePaths rather than strict.
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/opt/openalgo
+PrivateTmp=true
+
+# SQLite + many strategy subprocesses + sockets means a lot of file descriptors.
+# The default 1024 is too low for a long-running single-worker process.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

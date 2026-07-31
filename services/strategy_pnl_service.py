@@ -62,6 +62,10 @@ def attribute_fills(orders_by_orderid, fills):
                     "strategy": strategy or "",
                     "symbol": fill.get("symbol", ""),
                     "exchange": fill.get("exchange", ""),
+                    # Product (CNC/NRML/MIS) keeps independent product positions
+                    # on the same symbol from being netted together (a CNC long
+                    # and an MIS short are two positions, not a round-trip).
+                    "product": str(fill.get("product", "") or ""),
                     "action": str(fill.get("action", "")).upper(),
                     "quantity": qty,
                     "price": price,
@@ -151,19 +155,26 @@ def aggregate_strategy_pnl(attributed_fills, positions_ltp):
 
     positions_ltp = positions_ltp or {}
 
-    # Group fills by (strategy, symbol, exchange).
+    # Group fills by (strategy, symbol, exchange, product). Product is part of
+    # the key so a CNC and an MIS position on the same symbol never net into a
+    # phantom round-trip - they are independent positions.
     groups = {}
     for fill in attributed_fills:
         qty = int(fill.get("quantity", 0) or 0)
         price = float(fill.get("price", 0) or 0)
         if qty <= 0 or price <= 0:
             continue
-        key = (fill.get("strategy", ""), fill.get("symbol", ""), fill.get("exchange", ""))
+        key = (
+            fill.get("strategy", ""),
+            fill.get("symbol", ""),
+            fill.get("exchange", ""),
+            fill.get("product", ""),
+        )
         groups.setdefault(key, []).append(fill)
 
     # Accumulate per strategy.
     per_strategy = {}
-    for (strategy, _symbol, _exchange), fills in groups.items():
+    for (strategy, _symbol, _exchange, _product), fills in groups.items():
         netted = _net_group(fills, positions_ltp)
         acc = per_strategy.setdefault(
             strategy,
@@ -236,7 +247,12 @@ def _round_trip_stats(attributed_fills, positions_ltp):
         price = float(fill.get("price", 0) or 0)
         if qty <= 0 or price <= 0:
             continue
-        key = (fill.get("strategy", ""), fill.get("symbol", ""), fill.get("exchange", ""))
+        key = (
+            fill.get("strategy", ""),
+            fill.get("symbol", ""),
+            fill.get("exchange", ""),
+            fill.get("product", ""),
+        )
         groups.setdefault(key, []).append(fill)
 
     wins = losses = open_positions = 0
@@ -266,17 +282,39 @@ def _day_bounds(day):
 def build_attributed_fills_live(user_id, day):
     """Build attributed fills for live mode from OrderLog + the tradebook.
 
-    Reads today's ``placeorder`` / ``placesmartorder`` rows from ``order_logs``
+    Reads the day's ``placeorder`` / ``placesmartorder`` rows from ``order_logs``
     to map ``orderid`` -> ``strategy``, then joins that against the broker
     tradebook fills. All parsing is guarded; a bad row is skipped, never fatal.
 
+    IMPORTANT - live fills exist only for the CURRENT trading day. The broker
+    tradebook API (``get_tradebook``) is not date-parameterised: it always
+    returns the *current* day's fills and the broker resets it daily (~3 AM IST).
+    OpenAlgo does not persist live executed fill prices historically (the
+    ``placeorder`` response carries only the ``orderid``, never the average fill
+    price). Joining a past day's ``order_logs`` against today's tradebook would
+    therefore fabricate a track record. To make that structurally impossible,
+    this function returns ``[]`` for any ``day`` that is not today (IST). Live
+    per-day history beyond today is unavailable by design; the analyzer/sandbox
+    path (``build_attributed_fills_sandbox``) persists every trade with its price
+    and so supports the full historical range.
+
     Args:
         user_id: OpenAlgo session user id.
-        day: ``datetime.date`` (IST) to read orders for.
+        day: ``datetime.date`` (IST) to read orders for. Must be today (IST) to
+            yield fills; any earlier/later day yields ``[]``.
 
     Returns:
         List of attributed fill dicts (possibly empty).
     """
+    # The broker tradebook only ever holds the current trading day's fills, so a
+    # request for any other day cannot be answered from real data. Refuse rather
+    # than join stale OrderLog rows against today's tradebook (which would
+    # fabricate history). strategy-pnl only ever asks for today, so this is a
+    # no-op there. Checked BEFORE the DB/service imports so a past-day call does
+    # no I/O at all.
+    if day != datetime.now(IST).date():
+        return []
+
     import json
 
     from database.apilog_db import OrderLog, db_session
@@ -331,6 +369,7 @@ def build_attributed_fills_live(user_id, day):
                             else None,
                             "symbol": trade.get("symbol", ""),
                             "exchange": trade.get("exchange", ""),
+                            "product": trade.get("product", ""),
                             "action": trade.get("action", ""),
                             "quantity": trade.get("quantity", 0),
                             "price": trade.get("average_price", 0),
@@ -379,6 +418,7 @@ def build_attributed_fills_sandbox(user_id, day):
                             "orderid": row.orderid,
                             "symbol": row.symbol,
                             "exchange": row.exchange,
+                            "product": getattr(row, "product", "") or "",
                             "action": row.action,
                             "quantity": int(row.quantity),
                             "price": float(row.price),
@@ -401,6 +441,7 @@ def build_attributed_fills_sandbox(user_id, day):
                     "strategy": r["strategy"],
                     "symbol": r["symbol"],
                     "exchange": r["exchange"],
+                    "product": r.get("product", ""),
                     "action": str(r["action"]).upper(),
                     "quantity": qty,
                     "price": price,

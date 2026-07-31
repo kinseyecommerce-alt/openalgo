@@ -18,6 +18,7 @@ import {
   RefreshCw,
   ShieldAlert,
   Square,
+  TrendingUp,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -718,6 +719,13 @@ export default function Autonomous() {
               {pnl.mode === 'live' ? 'Live' : 'Analyzer'}
             </Badge>
           )}
+          <a
+            href="/performance"
+            className="inline-flex items-center gap-1.5 text-sm text-muted-foreground underline hover:text-foreground"
+          >
+            <TrendingUp className="h-3.5 w-3.5" />
+            View performance history
+          </a>
           <Button variant="outline" size="sm" onClick={refetch} disabled={loading}>
             <RefreshCw className={`h-4 w-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
             Refresh

@@ -49,6 +49,17 @@ _DEFAULTS = {
     "halted_at": None,
     "halted_reason": None,
     "halted_pnl": None,
+    # Daily capital allocation (see services/capital_service.py). Stored here
+    # because it is daily trading-risk config and this module already provides
+    # the atomic write + reentrant lock. Default 100% of the broker's available
+    # cash, i.e. no reduction until the operator sets one.
+    "capital_mode": "percent",
+    "capital_amount": 0.0,
+    "capital_percent": 100.0,
+    # Pre-trade hard cap (see services/capital_guard_service.py). Off by
+    # default: turning it on starts rejecting exposure-increasing orders.
+    "capital_guard_enabled": False,
+    "max_positions": 10,
 }
 
 
@@ -130,6 +141,26 @@ def _coerce_config(raw: dict) -> dict:
             )
         except (TypeError, ValueError):
             cfg["daily_loss_limit"] = _DEFAULTS["daily_loss_limit"]
+        # Capital allocation. An unknown mode falls back to the default rather
+        # than being trusted, so a corrupt file cannot change the allocation
+        # basis; the numbers are clamped by capital_service.resolve_allocation.
+        raw_mode = raw.get("capital_mode", _DEFAULTS["capital_mode"])
+        cfg["capital_mode"] = (
+            raw_mode if raw_mode in ("percent", "amount") else _DEFAULTS["capital_mode"]
+        )
+        for key in ("capital_amount", "capital_percent"):
+            try:
+                cfg[key] = float(raw.get(key, _DEFAULTS[key]))
+            except (TypeError, ValueError):
+                cfg[key] = _DEFAULTS[key]
+        cfg["capital_guard_enabled"] = bool(
+            raw.get("capital_guard_enabled", _DEFAULTS["capital_guard_enabled"])
+        )
+        try:
+            cfg["max_positions"] = int(raw.get("max_positions", _DEFAULTS["max_positions"]))
+        except (TypeError, ValueError):
+            cfg["max_positions"] = _DEFAULTS["max_positions"]
+
         cfg["halted_at"] = raw.get("halted_at")
         cfg["halted_reason"] = raw.get("halted_reason")
         hp = raw.get("halted_pnl")
@@ -202,19 +233,24 @@ def save_risk_config(cfg: dict, config_path: Path | str | None = None) -> bool:
 def update_risk_config(config_path: Path | str | None = None, **fields) -> dict:
     """Validate and apply the given fields, persist, and return the new config.
 
-    Accepts ``enabled`` (bool), ``daily_loss_limit`` (numeric > 0), and
-    ``flatten_on_halt`` (bool). Unknown fields are ignored. Invalid values
-    raise ``ValueError`` (the route turns this into a 4xx).
+    Accepts ``enabled`` (bool), ``daily_loss_limit`` (numeric > 0),
+    ``flatten_on_halt`` (bool), and the daily capital allocation fields
+    ``capital_mode`` (``"percent"``/``"amount"``), ``capital_amount``
+    (numeric >= 0) and ``capital_percent`` (numeric 0-100). Unknown fields are
+    ignored. Invalid values raise ``ValueError`` (the route turns this into a
+    4xx).
 
     Args:
         config_path: Optional override path (used by tests).
-        **fields: Any of ``enabled``, ``daily_loss_limit``, ``flatten_on_halt``.
+        **fields: Any of ``enabled``, ``daily_loss_limit``, ``flatten_on_halt``,
+            ``capital_mode``, ``capital_amount``, ``capital_percent``.
 
     Returns:
         The updated config dict.
 
     Raises:
-        ValueError: If ``daily_loss_limit`` is non-numeric or ``<= 0``.
+        ValueError: If ``daily_loss_limit`` is non-numeric or ``<= 0``, or a
+            capital field is non-numeric / out of range / an unknown mode.
     """
     # Validate BEFORE taking the lock so a bad request never blocks the monitor.
     if "daily_loss_limit" in fields:
@@ -226,6 +262,30 @@ def update_risk_config(config_path: Path | str | None = None, **fields) -> dict:
             raise ValueError("daily_loss_limit must be greater than 0")
     else:
         limit = None
+
+    # Validate the capital fields before the lock too, for the same reason.
+    if "capital_mode" in fields and fields["capital_mode"] not in ("percent", "amount"):
+        raise ValueError("capital_mode must be 'percent' or 'amount'")
+    capital_nums = {}
+    for key, hi in (("capital_amount", None), ("capital_percent", 100.0)):
+        if key in fields:
+            try:
+                val = float(fields[key])
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"{key} must be a number") from e
+            if val < 0:
+                raise ValueError(f"{key} must not be negative")
+            if hi is not None and val > hi:
+                raise ValueError(f"{key} must not exceed {hi:g}")
+            capital_nums[key] = val
+    max_positions_val = None
+    if "max_positions" in fields:
+        try:
+            max_positions_val = int(fields["max_positions"])
+        except (TypeError, ValueError) as e:
+            raise ValueError("max_positions must be a whole number") from e
+        if max_positions_val < 0:
+            raise ValueError("max_positions must not be negative")
 
     with _CONFIG_LOCK:
         # Re-read the freshest on-disk config UNDER the lock so we never write a
@@ -240,6 +300,13 @@ def update_risk_config(config_path: Path | str | None = None, **fields) -> dict:
             cfg["enabled"] = bool(fields["enabled"])
         if "flatten_on_halt" in fields:
             cfg["flatten_on_halt"] = bool(fields["flatten_on_halt"])
+        if "capital_mode" in fields:
+            cfg["capital_mode"] = fields["capital_mode"]
+        if "capital_guard_enabled" in fields:
+            cfg["capital_guard_enabled"] = bool(fields["capital_guard_enabled"])
+        if "max_positions" in fields:
+            cfg["max_positions"] = max_positions_val
+        cfg.update(capital_nums)
 
         save_risk_config(cfg, config_path)
         return cfg

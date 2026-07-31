@@ -13,7 +13,12 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "strategies")
 )
 
-from watchlist_loader import load_watchlist, parse_symbol_list, watchlist_file_path
+from watchlist_loader import (
+    empty_watchlist_warning,
+    load_watchlist,
+    parse_symbol_list,
+    watchlist_file_path,
+)
 
 DEFAULT_NSE = ["RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS"]
 
@@ -125,3 +130,72 @@ class TestLoadWatchlistPrecedence:
             "SBIN",
             "INFY",
         ]
+
+
+class TestEmptyWatchlistWarning:
+    """A strategy whose watchlist resolves to nothing scans NOTHING; the warning
+    must explain why and give the concrete next step, never stay silent."""
+
+    def test_none_when_symbols_present(self, tmp_path):
+        assert empty_watchlist_warning("NSE", None, ["SBIN"], tmp_path) is None
+
+    def test_mcx_unconfigured_names_resolver(self, tmp_path):
+        msg = empty_watchlist_warning("MCX", None, [], tmp_path)
+        assert msg is not None
+        assert "EXCHANGE=MCX" in msg
+        assert "mcx_resolver.py" in msg
+        assert "Scanning NOTHING" in msg
+
+    def test_nfo_unconfigured_names_nfo_resolver(self, tmp_path):
+        msg = empty_watchlist_warning("NFO", None, [], tmp_path)
+        assert msg is not None
+        assert "nfo_resolver.py" in msg
+        # Points at the index future, not the untradable index itself.
+        assert "NIFTY<expiry>FUT" in msg
+
+    def test_bfo_unconfigured_names_nfo_resolver(self, tmp_path):
+        msg = empty_watchlist_warning("BFO", None, [], tmp_path)
+        assert msg is not None
+        assert "nfo_resolver.py" in msg
+
+    def test_empty_env_reported_as_override(self, tmp_path):
+        # An explicit WATCHLIST="" is a deliberate scan-nothing, not a missing
+        # resolver run -- the message must not send the user to a resolver.
+        msg = empty_watchlist_warning("MCX", "", [], tmp_path)
+        assert msg is not None
+        assert "WATCHLIST is set" in msg
+        assert "mcx_resolver.py" not in msg
+
+    def test_existing_but_empty_file_called_out(self, tmp_path):
+        # An empty screened file is authoritative, so it silently disables
+        # trading -- the most confusing case; it must be named explicitly.
+        (tmp_path / "MCX.txt").write_text("# nothing resolved\n", encoding="utf-8")
+        msg = empty_watchlist_warning("MCX", None, [], tmp_path)
+        assert msg is not None
+        assert "MCX.txt" in msg
+        assert "authoritative" in msg
+
+    def test_unknown_exchange_still_warns(self, tmp_path):
+        msg = empty_watchlist_warning("CDS", None, [], tmp_path)
+        assert msg is not None
+        assert "EXCHANGE=CDS" in msg
+        assert "Scanning NOTHING" in msg
+
+    def test_missing_dir_is_safe(self, tmp_path):
+        msg = empty_watchlist_warning("NFO", None, [], tmp_path / "does_not_exist")
+        assert msg is not None
+        assert "nfo_resolver.py" in msg
+
+    def test_all_warnings_share_the_greppable_token(self, tmp_path):
+        # Operators grep logs for "Scanning NOTHING" - every branch must emit
+        # the identical token, so casing may not drift between messages.
+        (tmp_path / "BFO.txt").write_text("# empty\n", encoding="utf-8")
+        cases = [
+            empty_watchlist_warning("MCX", None, [], tmp_path),  # resolver branch
+            empty_watchlist_warning("CDS", None, [], tmp_path),  # unknown exchange
+            empty_watchlist_warning("MCX", "", [], tmp_path),  # env override
+            empty_watchlist_warning("BFO", None, [], tmp_path),  # empty file
+        ]
+        for msg in cases:
+            assert msg is not None
+            assert "Scanning NOTHING" in msg

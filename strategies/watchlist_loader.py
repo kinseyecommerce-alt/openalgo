@@ -164,6 +164,89 @@ def read_watchlists(
     return out
 
 
+# Exchange -> the resolver that writes its screened watchlist file. Derivative
+# and commodity symbols carry expiries, so there is no safe hardcoded default;
+# these resolvers rebuild the live near-month set (see strategies/README.md).
+_RESOLVER_FOR_EXCHANGE = {
+    "MCX": ("strategies/mcx_resolver.py", "CRUDEOIL<expiry>FUT"),
+    "NFO": ("strategies/nfo_resolver.py", "NIFTY<expiry>FUT"),
+    "BFO": ("strategies/nfo_resolver.py", "SENSEX<expiry>FUT"),
+}
+
+
+def empty_watchlist_warning(
+    exchange: str,
+    env_value: str | None,
+    symbols: list[str],
+    watchlist_dir: str | Path | None = None,
+) -> str | None:
+    """Explain an empty resolved watchlist, or return None when there is one.
+
+    A scanning strategy whose watchlist resolves to nothing scans NOTHING and
+    would otherwise sit silently idle looking healthy. This builds the operator-
+    facing warning describing WHY it is empty and the concrete next step, so the
+    silence is never mistaken for "no setups today".
+
+    Pure: no file writes, no network. It may stat the screened file only to say
+    whether one exists.
+
+    Args:
+        exchange: OpenAlgo exchange code the strategy trades (e.g. "NSE", "NFO").
+        env_value: The raw ``WATCHLIST`` env value, or None when unset.
+        symbols: The watchlist as resolved by :func:`load_watchlist`.
+        watchlist_dir: Optional override for the screened-file directory.
+
+    Returns:
+        The warning string, or None when ``symbols`` is non-empty (nothing to
+        warn about).
+    """
+    if symbols:
+        return None
+
+    code = (exchange or "").strip().upper()
+
+    # An explicitly empty env value is a deliberate "scan nothing" -- report it
+    # as intentional rather than implying a misconfiguration.
+    if env_value is not None:
+        return (
+            f"WARNING: WATCHLIST is set but resolves to no symbols on {code}. "
+            f"Scanning NOTHING. Unset WATCHLIST to fall back to the screened "
+            f"watchlist file, or set it to real symbols to trade."
+        )
+
+    path = watchlist_file_path(code, watchlist_dir)
+    try:
+        file_exists = path.is_file()
+    except OSError:
+        file_exists = False
+
+    if file_exists:
+        # The file is authoritative even when empty, so an empty one silently
+        # disables trading -- the most confusing case of all.
+        return (
+            f"WARNING: the screened watchlist {path} exists but contains no "
+            f"symbols. Scanning NOTHING. It is authoritative when present, so "
+            f"an empty file disables trading on {code}. Re-run the screener/"
+            f"resolver for {code}, or set WATCHLIST to override it."
+        )
+
+    resolver = _RESOLVER_FOR_EXCHANGE.get(code)
+    if resolver is not None:
+        script, example = resolver
+        return (
+            f"WARNING: EXCHANGE={code} with no WATCHLIST set and no {path.name} - "
+            f"{code} symbols carry expiries so there is NO safe default watchlist. "
+            f"Scanning NOTHING. Run `uv run python {script}` to resolve the current "
+            f"near-month contracts, or set WATCHLIST explicitly (e.g. {example})."
+        )
+
+    return (
+        f"WARNING: no symbols resolved for EXCHANGE={code} and no {path.name}. "
+        f"Scanning NOTHING. {code} symbols may carry expiries, so there is no safe "
+        f"default. Set WATCHLIST explicitly to trade."
+    )
+
+
 def load_watchlist(
     exchange: str,
     default_nse: list[str],
